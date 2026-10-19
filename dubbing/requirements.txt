@@ -1,0 +1,29 @@
+# Core pipeline
+yt-dlp>=2024.11.4
+audio-separator[cpu]>=0.24.0
+faster-whisper>=1.0.3
+openai>=1.50.0
+langgraph>=0.2.55
+ffmpeg-python>=0.2.0
+
+# Audio processing
+pydub>=0.25.1
+pyrubberband>=0.3.0
+soundfile>=0.12.1
+
+# ML / GPU
+torch>=2.1.0
+torchaudio>=2.1.0
+accelerate>=0.34.0
+
+# Lip sync face detection
+mediapipe>=0.10.0
+opencv-python>=4.8.0
+
+# UI
+gradio>=5.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+numpy>=1.26.0
+fal-client>=0.5.0

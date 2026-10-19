@@ -1,0 +1,69 @@
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+.env.local
+*.key
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ── Model weights (re-downloaded by scripts/setup_gpu.sh) ─────────────────────
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+*.h5
+*.tflite
+checkpoints/
+weights/
+pretrained/
+models--*/
+
+# ── Vendored third-party repos (re-cloned on setup) ───────────────────────────
+dubbing/Wav2Lip/
+dubbing/LatentSync/
+dubbing/MuseTalk/
+
+# ── Pipeline artifacts & media ────────────────────────────────────────────────
+dubbing/cache/
+dubbing/.gradio/
+data/
+outputs/
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.mov
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+
+# ── Caches ────────────────────────────────────────────────────────────────────
+.cache/
+.huggingface/
+.torch/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editors ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.claude/settings.local.json
