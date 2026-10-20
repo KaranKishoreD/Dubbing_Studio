@@ -59,9 +59,21 @@ def lipsync_node(state: PipelineState) -> dict:
             "log": state.get("log", []) + ["✓ Lip sync: no segments to process"],
         }
 
-    # Extract all original clips in parallel (fast FFmpeg seek)
+    backend_on = _USE_LOCAL or (_fal_key() and _FAL_ENABLED)
+    if not backend_on:
+        # No clip extraction: assemble's audio-overlay path never touches
+        # per-segment video, and re-encoding every clip just to discard it
+        # was pure wasted time.
+        return {
+            "segments": [s.to_dict() for s in segments],
+            "log": state.get("log", []) + [
+                "⚠ Lip sync skipped — set WAV2LIP_USE_LOCAL=1 in .env to enable"
+            ],
+        }
+
+    # Keyed by time range: segment ids are renumbered when sentences merge.
     def _ensure_clip(seg: Segment) -> None:
-        orig = segs_dir / f"s{seg.id:04d}_original.mp4"
+        orig = segs_dir / f"clip_{seg.start:.3f}_{seg.end:.3f}.mp4"
         if not orig.exists():
             _extract_clip(video_path, str(orig), seg.start, seg.end)
         seg.original_clip = str(orig)
@@ -71,17 +83,7 @@ def lipsync_node(state: PipelineState) -> dict:
 
     if _USE_LOCAL:
         return _lipsync_local(segments, to_sync, edit_ids, segs_dir)
-    elif _fal_key() and _FAL_ENABLED:
-        return _lipsync_fal(segments, to_sync, edit_ids, segs_dir)
-    else:
-        for seg in to_sync:
-            seg.lip_synced_clip = seg.original_clip
-        return {
-            "segments": [s.to_dict() for s in segments],
-            "log": state.get("log", []) + [
-                "⚠ Lip sync skipped — set WAV2LIP_USE_LOCAL=1 in .env to enable"
-            ],
-        }
+    return _lipsync_fal(segments, to_sync, edit_ids, segs_dir)
 
 
 # ── Local Wav2Lip + MediaPipe ─────────────────────────────────────────────────

@@ -65,6 +65,7 @@ BODHAN_CREDIT_WARNING = "⚠ Bodhan credit: ₹10 starting balance (~4 full 5-mi
 def run_full_pipeline(
     url: str, lang_name: str, domain: str,
     voice_name: str = "", voice_style_label: str = DEFAULT_STYLE_LABEL,
+    num_speakers: str = "Auto",
     progress=gr.Progress(),
 ):
     if not url.strip():
@@ -81,6 +82,7 @@ def run_full_pipeline(
         "video_id": video_id,
         "video_path": None,
         "audio_path": None,
+        "audio_hq_path": None,
         "vocals_path": None,
         "background_path": None,
         "voice_ref_path": None,
@@ -91,18 +93,25 @@ def run_full_pipeline(
         "error": None,
         "voice_name": voice_name.strip() or None,
         "voice_style": voice_style,
+        "speaker_profiles": {},
+        "num_speakers": int(num_speakers) if str(num_speakers).isdigit() else None,
     }
 
     stage_labels = [
-        "download", "separate", "transcribe", "translate",
+        "download", "separate", "transcribe", "diarize", "translate",
         "synthesize", "align", "lipsync", "assemble",
     ]
     final_state = state
 
+    progress(0, desc=f"[1/{len(stage_labels)}] {stage_labels[0]}…")
     for i, event in enumerate(FULL_PIPELINE.stream(state)):
         node_name = list(event.keys())[0]
         node_output = event[node_name]
-        progress((i + 1) / len(stage_labels), desc=f"[{i+1}/{len(stage_labels)}] {node_name}…")
+        # stream() yields when a node FINISHES, so name the one starting next.
+        nxt = i + 1
+        label = stage_labels[nxt] if nxt < len(stage_labels) else "done"
+        progress(nxt / len(stage_labels),
+                 desc=f"[{min(nxt + 1, len(stage_labels))}/{len(stage_labels)}] {label}…")
         final_state = {**final_state, **node_output}
 
         if node_output.get("error"):
@@ -163,10 +172,14 @@ def apply_edits(
     voice_style = BODHAN_STYLES.get(voice_style_label, "educational lecture")
     cache_dir = get_cache_dir(video_id)
 
-    # Reconstruct cached paths (separate_node writes to cache_dir/separated/)
+    # Reconstruct cached paths (separate_node writes to cache_dir/separated/).
+    # Prefer the Demucs stems; fall back to the raw-audio copy.
     sep_dir = cache_dir / "separated"
-    vocals = sep_dir / "vocals.wav"
-    background = sep_dir / "no_vocals.wav"
+    stems = sorted(sep_dir.glob("*_vocals.wav"))
+    vocals = stems[0] if stems else sep_dir / "vocals.wav"
+    bed = vocals.with_name(vocals.name.replace("_vocals.wav", "_bed.wav"))
+    background = bed if stems and bed.exists() else None
+    audio_hq = cache_dir / "audio_hq.wav"
     if not vocals.exists():
         return None, segments_state, _empty_df(), "✗ Cache missing — re-run full pipeline."
 
@@ -177,8 +190,9 @@ def apply_edits(
         "video_id": video_id,
         "video_path": str(cache_dir / "video.mp4"),
         "audio_path": str(cache_dir / "audio.wav"),
+        "audio_hq_path": str(audio_hq) if audio_hq.exists() else None,
         "vocals_path": str(vocals.resolve()),
-        "background_path": str(background.resolve()),
+        "background_path": str(background.resolve()) if background else None,
         "voice_ref_path": str(cache_dir / "voice_ref.wav"),
         "segments": segments_state,
         "final_video": None,
@@ -187,6 +201,7 @@ def apply_edits(
         "error": None,
         "voice_name": voice_name.strip() or None,
         "voice_style": voice_style,
+        "speaker_profiles": {},
     }
 
     edit_stages = ["translate", "synthesize", "align", "lipsync", "assemble"]
@@ -269,14 +284,21 @@ with gr.Blocks(title="YT Dubbing Studio") as demo:
 
     # ── Voice controls ────────────────────────────────────────────────────────
     gr.Markdown(
-        "**Voice:** Auto mode detects speaker pitch per segment and assigns male/female voice accordingly "
-        "(handles multi-speaker videos). Override with a specific voice name to force one voice for all segments."
+        "**Voice:** speakers are told apart by voice, each gets one consistent voice "
+        "(male/female from their pitch). If you know how many people speak, set it — "
+        "that is the most reliable. A voice name override forces one voice for everyone."
     )
     with gr.Row():
         with gr.Column(scale=1):
+            num_speakers_dropdown = gr.Dropdown(
+                choices=["Auto", "1", "2", "3", "4"],
+                value="Auto",
+                label="Number of speakers",
+            )
+        with gr.Column(scale=1):
             voice_name_input = gr.Textbox(
                 label="Voice name override (optional)",
-                placeholder="Leave blank = auto pitch-detect  |  e.g. Kavya / Amit / Arun / Sravani",
+                placeholder="Leave blank = auto  |  e.g. Kavya / Amit / Arun / Sravani",
             )
         with gr.Column(scale=2):
             voice_style_dropdown = gr.Dropdown(
@@ -344,16 +366,17 @@ with gr.Blocks(title="YT Dubbing Studio") as demo:
 
     # ── Event wiring ──────────────────────────────────────────────────────────
 
-    def _on_process(url, lang, dom, vname, vstyle, progress=gr.Progress()):
+    def _on_process(url, lang, dom, nspk, vname, vstyle, progress=gr.Progress()):
         orig, dubbed, df, segs, vid_id, log = run_full_pipeline(
-            url, lang, dom, vname, vstyle, progress
+            url, lang, dom, vname, vstyle, nspk, progress
         )
         dl = gr.File(value=dubbed, visible=bool(dubbed))
         return orig, dubbed, df, segs, vid_id, log, dl
 
     process_btn.click(
         _on_process,
-        inputs=[url_input, target_lang, domain, voice_name_input, voice_style_dropdown],
+        inputs=[url_input, target_lang, domain, num_speakers_dropdown,
+                voice_name_input, voice_style_dropdown],
         outputs=[
             original_video, dubbed_video,
             transcript_table, segments_state, video_id_state,

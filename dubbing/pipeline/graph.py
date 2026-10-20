@@ -3,6 +3,7 @@ from .state import PipelineState
 from .nodes.download import download_node
 from .nodes.separate import separate_node
 from .nodes.transcribe import transcribe_node
+from .nodes.diarize import diarize_node
 from .nodes.translate import translate_node
 from .nodes.synthesize import synthesize_node
 from .nodes.align import align_node
@@ -36,24 +37,27 @@ _SHARED_EDGES = [
     ("assemble", "END"),
 ]
 
-# Full pipeline: download → separate → transcribe → translate → … → assemble
+# Full pipeline: download → separate → transcribe → diarize → translate → … → assemble
 FULL_PIPELINE = _build(
     entry="download",
     edges=[
         ("download", "separate"),
         ("separate", "transcribe"),
-        ("transcribe", "translate"),
+        ("transcribe", "diarize"),
+        ("diarize", "translate"),
         *_SHARED_EDGES,
     ],
     nodes={
         "download": download_node,
         "separate": separate_node,
         "transcribe": transcribe_node,
+        "diarize": diarize_node,
         **_SHARED_NODES,
     },
 )
 
-# Edit pipeline: skips download/separate/transcribe — only re-runs from translate onward
+# Edit pipeline: skips download/separate/transcribe/diarize — speaker and gender
+# are already persisted on each segment, so edits re-run from translate onward.
 EDIT_PIPELINE = _build(
     entry="translate",
     edges=_SHARED_EDGES,
