@@ -31,12 +31,21 @@ class Segment:
     # Second transcription of the same audio (Whisper, when text came from
     # Bodhan). Passed to the translator to reconcile recognition errors.
     asr_alt: Optional[str] = None
+    # Lip-synced pieces of this line: [{"start", "end", "path"}]. Only shots
+    # that show the speaker's own face are synced; the dub may borrow silence
+    # after the line, so a piece can end later than `end`.
+    sync_clips: List[dict] = field(default_factory=list)
+    # Set by edits: leave this line undubbed (original audio + video), and a
+    # Bodhan style that overrides the measured delivery for this line.
+    keep_original: bool = False
+    style_override: Optional[str] = None
 
     _FIELDS = {
         "id", "start", "end", "text", "lang", "words",
         "dubbed_text", "dubbed_audio", "aligned_audio",
         "lip_synced_clip", "original_clip", "edit_instruction", "edit_hash",
         "speaker", "gender", "f0", "voice", "delivery", "pace", "asr_alt",
+        "sync_clips", "keep_original", "style_override",
     }
 
     @property
@@ -74,6 +83,7 @@ class PipelineState(TypedDict):
     voice_ref_path: Optional[str]
     segments: List[dict]
     final_video: Optional[str]
+    final_audio: Optional[str]         # the dubbed soundtrack alone, browser-playable
     edit_ops: List[dict]
     log: List[str]
     error: Optional[str]
@@ -84,3 +94,8 @@ class PipelineState(TypedDict):
     speaker_profiles: dict
     # Known speaker count from the UI; None = detect automatically
     num_speakers: Optional[int]
+    # Per-speaker voice chosen in the UI: {"0": "Kavya", ...}. Speakers not
+    # listed are cast automatically.
+    voice_map: dict
+    # How much English stays in the translation: pure | natural | heavy
+    lang_mix: Optional[str]

@@ -15,7 +15,9 @@ torchaudio>=2.7.0
 torchvision>=0.22.0
 
 # ── ASR: transcription + forced alignment + diarization ───────────────────────
-whisperx>=3.3.0
+# whisperx is NOT used: it pins torch~=2.8 and would downgrade the cu128
+# torch (and pull ~3 GB of CUDA wheels). pyannote is called directly.
+# whisperx>=3.3.0
 faster-whisper>=1.1.0
 
 # Speaker diarization. Needs HF_TOKEN in .env and you must accept the gated

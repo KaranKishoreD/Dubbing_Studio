@@ -53,24 +53,26 @@ def assemble_node(state: PipelineState) -> dict:
     cache_dir = get_cache_dir(state["video_id"])
     video_path = state["video_path"]
 
-    # Check if real lip sync was applied (clip differs from original)
-    has_lipsync = any(
+    # LatentSync pieces are overlaid onto the original video at their own
+    # times; the soundtrack is always the full-quality mix below.
+    synced = [p for s in segments for p in (s.sync_clips or []) if Path(p["path"]).exists()]
+    legacy = any(
         seg.lip_synced_clip
         and seg.original_clip
         and seg.lip_synced_clip != seg.original_clip
         for seg in segments
     )
 
-    if has_lipsync:
+    if legacy and not synced:
         return _assemble_with_lipsync(segments, cache_dir, video_path, state)
-    else:
-        return _assemble_audio_overlay(segments, cache_dir, video_path, state)
+    return _assemble_audio_overlay(segments, cache_dir, video_path, state, synced)
 
 
 # ── Audio-overlay path (no lip sync) ─────────────────────────────────────────
 
 def _assemble_audio_overlay(
-    segments: list[Segment], cache_dir: Path, video_path: str, state: PipelineState
+    segments: list[Segment], cache_dir: Path, video_path: str, state: PipelineState,
+    synced: list[dict] | None = None,
 ) -> dict:
     """
     Keep the video untouched; rebuild the soundtrack.
@@ -154,20 +156,36 @@ def _assemble_audio_overlay(
     mixed_audio = cache_dir / "mixed_audio.wav"
     sf.write(str(mixed_audio), mix, sr, subtype="FLOAT")
 
-    final_path = cache_dir / f"dubbed_{state['target_lang']}.mp4"
-    cmd = [
-        "ffmpeg",
-        "-i", video_path,
-        "-i", str(mixed_audio),
-        "-c:v", "copy",        # original video untouched — no re-encode
-        "-c:a", "aac", "-b:a", "192k",
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-    ]
+    # The soundtrack on its own, as AAC: plays in any browser, so the UI can
+    # offer it directly instead of only inside the video.
+    lang = state["target_lang"]
+    final_audio = cache_dir / f"dubbed_{lang}.m4a"
+    acmd = ["ffmpeg", "-i", str(mixed_audio)]
     if _LOUDNORM:
-        cmd += ["-af", f"loudnorm=I={_LUFS_TARGET}:TP={_TRUE_PEAK}:LRA=11"]
-    cmd += [str(final_path), "-y"]
+        acmd += ["-af", f"loudnorm=I={_LUFS_TARGET}:TP={_TRUE_PEAK}:LRA=11"]
+    acmd += ["-ar", "48000", "-c:a", "aac", "-b:a", "192k", str(final_audio), "-y"]
+    subprocess.run(acmd, check=True, capture_output=True)
 
+    final_path = cache_dir / f"dubbed_{lang}.mp4"
+    lip_note = ""
+    if synced:
+        video_src = _overlay_synced(video_path, synced, cache_dir)
+        lip_note = f"; {len(synced)} lip-synced shot(s) composited"
+    else:
+        video_src = video_path
+    vcodec = _video_codec(video_src)
+    cmd = [
+        "ffmpeg", "-i", video_src, "-i", str(final_audio),
+        "-map", "0:v:0", "-map", "1:a:0",
+        # Browsers play H.264 + AAC everywhere; anything else is re-encoded.
+        *(["-c:v", "copy"] if vcodec == "h264" else
+          ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p"]),
+        "-c:a", "copy",
+        # Index at the front so the player starts at once and can seek
+        # without downloading the whole file first.
+        "-movflags", "+faststart", "-shortest",
+        str(final_path), "-y",
+    ]
     subprocess.run(cmd, check=True, capture_output=True)
 
     note = (
@@ -177,11 +195,90 @@ def _assemble_audio_overlay(
     )
     if _LOUDNORM:
         note += f"; normalized to {_LUFS_TARGET} LUFS"
+    note += lip_note
 
     return {
         "final_video": str(final_path),
+        "final_audio": str(final_audio),
         "log": state.get("log", []) + [note],
     }
+
+
+# How many lip-synced clips go into one ffmpeg overlay pass.
+_OVERLAY_BATCH = 24
+
+
+def _overlay_synced(video_path: str, synced: list[dict], cache_dir: Path) -> str:
+    """
+    Lay each lip-synced clip over the original video at its own time span.
+    Everything outside those spans is the original frames, so timing cannot
+    drift the way concatenating dozens of re-encoded pieces does. LatentSync
+    renders at 25 fps; each clip is converted to the source frame rate first.
+    """
+    fps = _video_fps(video_path)
+    w, h = _video_size(video_path)
+    src = video_path
+    batches = [synced[i:i + _OVERLAY_BATCH] for i in range(0, len(synced), _OVERLAY_BATCH)]
+    for b, batch in enumerate(batches):
+        out = cache_dir / f"lipsync_video_{b}.mp4"
+        cmd = ["ffmpeg", "-i", src]
+        for piece in batch:
+            cmd += ["-i", piece["path"]]
+        parts, last = [], "0:v"
+        for k, piece in enumerate(batch, 1):
+            a, b = piece["start"], piece["end"]
+            parts.append(
+                f"[{k}:v]{_to_fps(fps)},scale={w}:{h},format=yuv420p,"
+                f"setpts=PTS-STARTPTS+{a:.3f}/TB[c{k}]")
+            parts.append(
+                f"[{last}][c{k}]overlay=eof_action=pass:"
+                f"enable='between(t,{a:.3f},{b:.3f})'[v{k}]")
+            last = f"v{k}"
+        cmd += ["-filter_complex", ";".join(parts), "-map", f"[{last}]", "-an",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                "-pix_fmt", "yuv420p", str(out), "-y"]
+        subprocess.run(cmd, check=True, capture_output=True)
+        src = str(out)
+    return src
+
+
+# LatentSync renders at 25 fps. Converting that to a 30/60 fps video by
+# repeating frames stutters visibly (one duplicate in every five at 30 fps),
+# so other rates are rebuilt with motion-compensated interpolation. 25 fps
+# videos are untouched by this.
+_LS_FPS = 25.0
+
+
+def _to_fps(fps: str) -> str:
+    try:
+        num, _, den = fps.partition("/")
+        rate = float(num) / float(den or 1)
+    except ValueError:
+        rate = _LS_FPS
+    if abs(rate - _LS_FPS) < 0.01:
+        return f"fps={fps}"
+    return f"minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
+
+
+def _ffprobe_stream(path: str, entries: str) -> str:
+    return subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         f"stream={entries}", "-of", "default=nw=1:nk=1", path],
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _video_codec(path: str) -> str:
+    return _ffprobe_stream(path, "codec_name")
+
+
+def _video_fps(path: str) -> str:
+    return _ffprobe_stream(path, "r_frame_rate") or "25"
+
+
+def _video_size(path: str) -> tuple[int, int]:
+    w, h = _ffprobe_stream(path, "width,height").split()[:2]
+    return int(w), int(h)
 
 
 def _read_stereo(path: str, target_sr: int | None = None):

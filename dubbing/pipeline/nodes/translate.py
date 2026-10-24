@@ -69,20 +69,65 @@ Rules:
 4. Translate meaning, not words. Use idioms, fillers and interjections a
    native {lang} speaker would naturally use ("Yeah", "Oh really?", "You're
    kidding" all have natural spoken equivalents).
-5. Keep names, brands, places, numbers and common English loanwords that
-   {lang} speakers actually say in English (job, office, weekend, team...),
-   BUT write every word in {lang} script — transliterate loanwords and names
-   (e.g. "job" → the {lang}-script spelling of job). No Latin letters at all:
-   the text-to-speech voice reads {lang} script and mispronounces Latin.
-6. Length: the line must be speakable in "seconds". Aim for roughly
-   budget_chars characters or fewer. Prefer natural brevity to padding, but
-   never drop meaning that matters.
+5. {mix}
+   {script_rule}
+6. Length is a HARD limit: budget_chars is how many {lang} characters the
+   voice can speak in "seconds" at a natural pace (measured, not guessed).
+   Never exceed it. {lang} often needs more characters than English for the
+   same idea, so when a faithful translation runs long, say it the way a
+   native speaker would say it briefly — shorter words, drop filler,
+   restructure — instead of translating word for word. Keep the meaning
+   that matters; coming in well under the budget is fine.
 7. One output line per input line, same id. Do not merge, split, or move
    content between lines — each line plays at its own time.
 {extra}
 Return ONLY a JSON array, no markdown:
 [{{"id": <int>, "text": "<{lang} line>"}}]
 """
+
+# Script for English words that stay English. Bodhan mispronounces Latin
+# text, so for it they are transliterated; Sarvam Bulbul reads code-mixed
+# text, so there they stay in Latin script and sound like English.
+_SCRIPT_NATIVE = ('BUT write every word in {lang} script — transliterate loanwords and names\n'
+                  '   (e.g. "job" → the {lang}-script spelling of job). No Latin letters at all:\n'
+                  '   the text-to-speech voice reads {lang} script and mispronounces Latin.')
+_SCRIPT_LATIN = ('Words that stay English are written in normal English spelling '
+                 '(Latin letters), e.g. "office", "weekend", "actually" — the voice '
+                 'pronounces them as English. Everything else is in {lang} script. '
+                 'Never write {lang} words in Latin letters.')
+SARVAM_LANGS = {"hi", "bn", "ta", "te", "kn", "ml", "mr", "gu", "pa", "or", "en"}
+
+
+def latin_allowed(state) -> bool:
+    """English words may stay in Latin script only when Sarvam voices them."""
+    code = state["target_lang"].split("-")[0]
+    return ((state.get("tts_backend") or "").lower() == "sarvam"
+            and code in SARVAM_LANGS and bool(os.environ.get("SARVAM_API_KEY")))
+
+
+# How much English stays in the dub. Real spoken Tamil/Hindi/… is full of
+# English; translating every word into its pure form sounds like a news
+# bulletin, not a person.
+LANG_MIX = os.environ.get("LANG_MIX", "standard").lower()
+_MIX_TEXT = {
+    # The original rule, unchanged — the default.
+    "standard": ("Keep names, brands, places, numbers and common English loanwords "
+                 "that {lang} speakers actually say in English (job, office, weekend, "
+                 "team...),"),
+    "pure": ("PURE {lang}. Translate everything; keep English only for names, "
+             "brands and technical terms that have no {lang} equivalent."),
+    "natural": ("NATURAL SPOKEN {lang}, the way a modern {lang} speaker really talks. "
+                "Keep the English words such speakers keep in everyday conversation — "
+                "common loanwords (office, meeting, weekend, phone, plan, problem, "
+                "sorry, okay, actually, basically, seriously), technology and brand "
+                "terms, and English the source speaker uses as a set phrase. Never "
+                "replace a common English word with a rare pure-{lang} coinage nobody "
+                "says. Grammar, verbs and connecting words stay {lang}. If a speaker "
+                "already mixes {lang} and English, keep their level of mixing."),
+    "heavy": ("CODE-MIXED speech ({lang} + English, like urban young speakers or "
+              "vloggers): keep many English words and short English phrases; {lang} "
+              "supplies the grammar, verb endings and connectors."),
+}
 
 _TONE_KEYWORDS = {
     "funny", "formal", "casual", "energetic", "slow", "sad", "happy",
@@ -153,6 +198,9 @@ def translate_node(state: PipelineState) -> dict:
     seg_map = {s.id: s for s in segments}
     target_lang = state["target_lang"]
     use_llm = _TRANSLATOR == "llm" and bool(os.environ.get("OPENROUTER_API_KEY"))
+    mix = (state.get("lang_mix") or LANG_MIX).lower()
+    if mix not in _MIX_TEXT:
+        mix = "standard"
 
     if use_llm:
         # One group per instruction: plain lines together, each edit
@@ -163,12 +211,15 @@ def translate_node(state: PipelineState) -> dict:
         failed: list[Segment] = []
         for instruction, group in groups.items():
             failed += _translate_dialogue(group, segments, target_lang,
-                                          instruction, state.get("domain"))
+                                          instruction, state.get("domain"), mix=mix,
+                                          latin=latin_allowed(state))
         if failed:
             _translate_bodhan_parallel(failed, target_lang, seg_map)
         notes = [
             f"✓ Translated {len(pending)} lines as one dialogue with {TRANSLATE_MODEL} "
-            f"(register: {_REGISTER}, speaker gender + timing aware)"
+            f"(register: {_REGISTER}, language mix: {mix}"
+            f"{', English kept in English spelling' if latin_allowed(state) else ''}, "
+            "speaker gender + timing aware)"
             + (f"; {len(failed)} fell back to Bodhan" if failed else "")
         ]
     else:
@@ -210,7 +261,8 @@ def translate_node(state: PipelineState) -> dict:
 
 def _translate_dialogue(
     group: list[Segment], all_segments: list[Segment], target_lang: str,
-    instruction: str | None, domain: str | None,
+    instruction: str | None, domain: str | None, mix: str = LANG_MIX,
+    latin: bool = False,
 ) -> list[Segment]:
     """
     Translate `group` in context. Writes seg.dubbed_text in place and returns
@@ -230,17 +282,20 @@ def _translate_dialogue(
     system = _DIALOGUE_SYSTEM.format(
         lang=lang,
         register=_REGISTER_TEXT.get(_REGISTER, _REGISTER_TEXT["spoken"]).format(lang=lang),
+        mix=_MIX_TEXT.get(mix, _MIX_TEXT["standard"]).format(lang=lang),
+        script_rule=(_SCRIPT_LATIN if latin else _SCRIPT_NATIVE).format(lang=lang),
         extra=extra,
     )
 
     group = sorted(group, key=lambda s: s.start)
     chunks = [group[i:i + _CHUNK_LINES] for i in range(0, len(group), _CHUNK_LINES)]
+    budgets = time_budgets(ordered, target_lang)
 
     def run(chunk: list[Segment]) -> dict[int, str]:
         lines = [{
             "id": s.id, "speaker": s.speaker, "gender": s.gender or "unknown",
-            "seconds": round(s.duration, 2),
-            "budget_chars": max(4, int(s.duration * _CHARS_PER_SEC)),
+            "seconds": budgets[s.id][0],
+            "budget_chars": budgets[s.id][1],
             "text": s.text,
             **({"alt_text": s.asr_alt} if s.asr_alt and s.asr_alt != s.text else {}),
         } for s in chunk]
@@ -270,14 +325,14 @@ def _translate_dialogue(
     # partly in the wrong script (it occasionally leaks Latin or even
     # katakana into Tamil, which the TTS voice then mangles).
     code = target_lang.split("-")[0]
-    bad = [s for s in group if s.id not in done or not script_ok(done[s.id], code)]
+    bad = [s for s in group if s.id not in done or not script_ok(done[s.id], code, latin)]
     if bad and len(bad) < len(group):
         try:
             done.update(run(bad))
         except Exception as exc:
             print(f"  ⚠ retry for {len(bad)} line(s) failed: {exc}")
     for s in group:
-        if s.id in done and not script_ok(done[s.id], code):
+        if s.id in done and not script_ok(done[s.id], code, latin):
             del done[s.id]                 # still wrong script → Bodhan fallback
 
     for s in group:
@@ -301,12 +356,15 @@ _SCRIPTS: dict[str, list[tuple[int, int]]] = {
 }
 
 
-def script_ok(text: str, lang_code: str) -> bool:
-    """True if every letter in `text` belongs to the target language's script."""
+def script_ok(text: str, lang_code: str, latin: bool = False) -> bool:
+    """True if every letter in `text` belongs to the target language's script
+    (or is basic Latin, when English words may stay in English spelling)."""
     import unicodedata
     blocks = _SCRIPTS.get(lang_code)
     if not blocks:
         return True                        # e.g. English target: nothing to check
+    if latin:
+        blocks = blocks + [(0x41, 0x5A), (0x61, 0x7A)]
     for ch in text:
         if not unicodedata.category(ch)[0] in ("L", "M"):
             continue                       # digits, punctuation, spaces are fine
@@ -328,7 +386,27 @@ _CHARS_PER_SEC = float(os.environ.get("TTS_CHARS_PER_SEC", "14"))
 # Deliberately loose: this pre-synthesis check uses a rough chars/sec guess,
 # so it only catches egregious overruns. synthesize_node re-checks with the
 # real clip lengths and shortens precisely.
-_OVERRUN_TRIGGER = float(os.environ.get("OVERRUN_TRIGGER", "1.7"))
+_OVERRUN_TRIGGER = float(os.environ.get("OVERRUN_TRIGGER", "1.15"))
+_BUDGET_BORROW = float(os.environ.get("BUDGET_BORROW_SECS", "0.6"))
+
+
+def time_budgets(ordered: list[Segment], target_lang: str) -> dict[int, tuple[float, int]]:
+    """
+    {id: (seconds, budget_chars)} per line. Seconds is the line's real slot —
+    up to the next line, borrowing trailing silence — and characters come from
+    the voice's measured speaking rate in this language.
+    """
+    from .align import slot_seconds
+    from ..tts_rate import chars_per_sec
+    cps = chars_per_sec(target_lang.split("-")[0])
+    out = {}
+    for i, s in enumerate(ordered):
+        # Borrowing silence is a safety margin for the fitter, not part of the
+        # target: a line written to fill 3 s of borrowed pause keeps talking
+        # long after the speaker's mouth has stopped.
+        secs = min(slot_seconds(ordered, i, None), s.duration + _BUDGET_BORROW)
+        out[s.id] = (round(secs, 2), max(4, int(secs * cps * 0.95)))
+    return out
 
 _COMPRESS_SYSTEM = """\
 You shorten dubbed subtitle lines so they can be spoken aloud in a fixed time.
@@ -358,11 +436,12 @@ def _compress_overlong(segments: list[Segment], target_lang: str) -> int:
     if not os.environ.get("OPENROUTER_API_KEY"):
         return 0
 
+    budgets = time_budgets(sorted(segments, key=lambda s: s.start), target_lang)
     jobs: list[tuple[Segment, int]] = []
     for seg in segments:
         if not seg.dubbed_text:
             continue
-        budget = int(seg.duration * _CHARS_PER_SEC)
+        budget = budgets[seg.id][1]
         if budget > 0 and len(seg.dubbed_text) > budget * _OVERRUN_TRIGGER:
             jobs.append((seg, budget))
 
@@ -374,6 +453,42 @@ def _compress_overlong(segments: list[Segment], target_lang: str) -> int:
     for sid, text in new.items():
         seg_map[sid].dubbed_text = text
     return len(new)
+
+
+_TRANSLIT_SYSTEM = """\
+Rewrite each line so every word in Latin letters is written in {lang} script,
+spelled the way a {lang} speaker pronounces it ("office" → the {lang}-script
+spelling of office). Change nothing else — same words, same order.
+Return ONLY JSON: [{{"id": <int>, "text": "<line>"}}]
+"""
+
+
+def transliterate_latin(items: list[tuple[int, str]], lang_code: str) -> dict[int, str]:
+    """{id: text with Latin words in native script} — for voices that cannot
+    read Latin (Bodhan). Lines that fail keep their text."""
+    if not items or not os.environ.get("OPENROUTER_API_KEY"):
+        return {}
+    lang = LANG_NAMES.get(lang_code, lang_code)
+    try:
+        resp = _openrouter_client().chat.completions.create(
+            model=os.environ.get("TRANSLIT_MODEL", "google/gemini-3.8-flash"),
+            messages=[{"role": "system", "content": _TRANSLIT_SYSTEM.format(lang=lang)},
+                      {"role": "user", "content": json.dumps(
+                          [{"id": i, "text": t} for i, t in items], ensure_ascii=False)}],
+            temperature=0.0, timeout=60)
+        out = _parse_items(resp.choices[0].message.content.strip())
+    except Exception as exc:
+        print(f"  ⚠ transliteration skipped: {exc}")
+        return {}
+    wanted = dict(items)
+    return {it["id"]: str(it["text"]).strip() for it in out
+            if isinstance(it, dict) and it.get("id") in wanted and it.get("text")
+            and script_ok(str(it["text"]), lang_code)}
+
+
+def has_latin(text: str | None) -> bool:
+    import re
+    return bool(text) and bool(re.search(r"[A-Za-z]", text))
 
 
 def condense_to_budget(jobs: list[tuple[int, str, int]]) -> dict[int, str]:

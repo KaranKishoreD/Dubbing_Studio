@@ -26,9 +26,18 @@ _MAX_SECS = 29.0          # API limit is 30 s per request
 _PAD = 0.15               # keep word edges Whisper's timing may clip
 
 
-def enabled() -> bool:
+def enabled(source_lang: str | None = None) -> bool:
+    """
+    ASR_TEXT=auto (default): Bodhan re-transcribes only Indic-language
+    sources. On English speech Whisper large-v3 is clearly better — it
+    punctuates, keeps case, and Bodhan mis-hears words that flip the meaning
+    ("your father" → "my father") or returns garbage on some lines.
+    ASR_TEXT=bodhan forces it, ASR_TEXT=whisper disables it.
+    """
     mode = os.environ.get("ASR_TEXT", "bodhan").lower()
-    return mode == "bodhan" and bool(os.environ.get("BODHAN_TRANSCRIBE_KEY"))
+    if not os.environ.get("BODHAN_TRANSCRIBE_KEY") or mode == "whisper":
+        return False
+    return mode == "bodhan" or (source_lang or "en").split("-")[0] != "en"
 
 
 def retranscribe(segments: list[Segment], audio: np.ndarray, cache_dir: Path,

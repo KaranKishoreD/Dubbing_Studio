@@ -44,12 +44,13 @@ def resolve_edits(user_message: str, segments: list[Segment]) -> list[dict]:
     )
 
     transcript_context = "\n".join(
-        f"[S{s.id}] {s.start:.1f}s–{s.end:.1f}s [{s.lang}]: {s.text}"
+        f"[S{s.id}] {s.start:.1f}s–{s.end:.1f}s Speaker {(s.speaker or 0) + 1}: {s.text}"
+        + (f"  →  dub: {s.dubbed_text}" if s.dubbed_text else "")
         for s in segments
     )
 
     response = client.chat.completions.create(
-        model="openai/gpt-4o-mini",
+        model=os.environ.get("EDIT_MODEL", "google/gemini-3.8-flash"),
         messages=[
             {"role": "system", "content": RESOLVER_SYSTEM},
             {
@@ -58,22 +59,49 @@ def resolve_edits(user_message: str, segments: list[Segment]) -> list[dict]:
             },
         ],
         temperature=0.1,
+        timeout=60,
     )
 
-    raw = response.choices[0].message.content.strip()
+    raw = (response.choices[0].message.content or "").strip()
     ops = extract_json_array(raw)
+    # Some models wrap the list: {"operations": [...]}.
+    if len(ops) == 1 and isinstance(ops[0], dict) and "segment_ids" not in ops[0]:
+        inner = next((v for v in ops[0].values() if isinstance(v, list)), None)
+        if inner is not None:
+            ops = inner
 
-    # Validate and clamp segment IDs to actual range
+    # Validate and clamp segment IDs to actual range. Models return ids as
+    # 3, "3", "S3" or 3.0 — all mean segment 3; dropping the non-int forms is
+    # what made every parse come back with zero operations.
     valid_ids = {s.id for s in segments}
     cleaned = []
     for op in ops:
         if not isinstance(op, dict):
             continue
-        ids = [sid for sid in op.get("segment_ids", []) if sid in valid_ids]
-        if ids and op.get("instruction"):
-            op["segment_ids"] = ids
-            cleaned.append(op)
+        ids = [i for i in (_as_id(x) for x in _as_list(op.get("segment_ids")))
+               if i in valid_ids]
+        instruction = str(op.get("instruction") or "").strip()
+        if ids and instruction:
+            cleaned.append({"segment_ids": sorted(set(ids)), "instruction": instruction,
+                            "reason": str(op.get("reason") or "")})
+    if not cleaned:
+        raise ValueError(f"No usable edit operations in the model's reply:\n{raw[:400]}")
     return cleaned
+
+
+def _as_list(v) -> list:
+    if v is None:
+        return []
+    return v if isinstance(v, list) else [v]
+
+
+def _as_id(x) -> int | None:
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        return int(x)
+    m = re.search(r"\d+", str(x))
+    return int(m.group()) if m else None
 
 
 def extract_json_array(raw: str) -> list:

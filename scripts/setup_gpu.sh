@@ -29,7 +29,10 @@ command -v rubberband >/dev/null 2>&1 \
 # ── 2. Python env ─────────────────────────────────────────────────────────────
 if [ ! -d .venv ]; then
   echo "▶ Creating .venv"
-  python3 -m venv .venv
+  # Python 3.11: several ML deps (mediapipe, pyannote, insightface) have no
+  # wheels for 3.13+ yet.
+  PY311=$(command -v python3.11 || echo python3)
+  "$PY311" -m venv .venv
 fi
 # shellcheck disable=SC1091
 source .venv/bin/activate 2>/dev/null || source .venv/Scripts/activate
@@ -82,7 +85,17 @@ if [[ "${ans:-N}" =~ ^[Yy]$ ]]; then
   if [ ! -d dubbing/LatentSync ]; then
     git clone https://github.com/bytedance/LatentSync dubbing/LatentSync
   fi
-  pip install -r dubbing/LatentSync/requirements.txt || \
+  # LatentSync pins torch 2.5.1/cu121 (no Blackwell kernels) and old
+  # diffusers/transformers that clash with the pipeline, so it gets its own
+  # venv with a cu128 torch. lipsync.py runs it out of process.
+  LSV=dubbing/LatentSync/.venv-ls
+  [ -d "$LSV" ] || python3 -m venv "$LSV"
+  "$LSV/bin/pip" install --upgrade pip wheel
+  "$LSV/bin/pip" install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+      --index-url https://download.pytorch.org/whl/cu128
+  grep -vE "^(torch|torchvision|--extra-index-url|gradio|mediapipe|lpips|face-alignment)" \
+      dubbing/LatentSync/requirements.txt > /tmp/latentsync-reqs.txt
+  "$LSV/bin/pip" install -r /tmp/latentsync-reqs.txt soundfile || \
     echo "⚠ Some LatentSync deps failed — check its README"
   python - <<'PY'
 from huggingface_hub import snapshot_download

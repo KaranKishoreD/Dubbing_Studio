@@ -6,8 +6,11 @@ and sentence merging can glue a question to its answer. Deciding "who" per
 merged sentence then mixes voices, which both scrambles the clustering and
 gives half a line the wrong voice. So, as WhisperX/pyannote do:
 
-  1. Embed short SLIDING WINDOWS of speech (SpeechBrain ECAPA-TDNN).
-  2. Cluster the windows into speakers; fold tiny clusters into their nearest
+  1-2. pyannote speaker-diarization-3.1 on the GPU (DIARIZE_BACKEND=pyannote,
+     default): overlap-aware turns, then clusters that are one person split
+     by tone are merged by voiceprint. Fallback (no HF_TOKEN / failure):
+     embed short SLIDING WINDOWS of speech (SpeechBrain ECAPA-TDNN) and
+     cluster the windows into speakers; fold tiny clusters into their nearest
      neighbour; optionally force the speaker count (NUM_SPEAKERS).
   3. Give every WORD the speaker of the window centred nearest to it, smooth
      out sub-second flickers, and split Whisper segments where the speaker
@@ -54,6 +57,16 @@ _SR = 16000
 _MODEL_DIR = Path("cache") / "_models" / "ecapa"
 _encoder = None
 
+# pyannote | ecapa
+_BACKEND = os.environ.get("DIARIZE_BACKEND", "pyannote").lower()
+_PYANNOTE_MODEL = os.environ.get("PYANNOTE_MODEL", "pyannote/speaker-diarization-community-1")
+# Two pyannote speakers whose voiceprints are at least this similar, and who
+# never talk at the same time, are one person split by a change of tone
+# (questions vs. statements, laughing). Two different men with similar
+# voices measure well below this, so they stay apart.
+_PYANNOTE_MERGE_SIM = float(os.environ.get("PYANNOTE_MERGE_SIM", "0.75"))
+_pipeline = None
+
 
 def diarize_node(state: PipelineState) -> dict:
     from .transcribe import merge_into_sentences
@@ -75,21 +88,33 @@ def diarize_node(state: PipelineState) -> dict:
     audio, _ = librosa.load(vocals_path, sr=_SR, mono=True)
     forced = _forced_speaker_count(state)
 
-    # ── 1-2. Windows → embeddings → speakers ─────────────────────────────────
-    windows = _make_windows(raw)
-    method = "ECAPA windows"
-    try:
-        emb = _embed([audio[int(a * _SR):int(b * _SR)] for _, a, b in windows])
-        wlab = _cluster_windows(emb, windows, forced)
-    except Exception as exc:
-        method = f"fallback: one speaker ({type(exc).__name__})"
-        wlab = np.zeros(len(windows), dtype=int)
-
-    # ── 3. Words → speakers → speaker-pure pieces ────────────────────────────
+    # ── 1-3. Who spoke when → every word → speaker-pure pieces ──────────────
+    # pyannote (GPU, overlap-aware, trained for exactly this) when available;
+    # the ECAPA sliding-window clustering below is the fallback.
     pieces: list[Segment] = []
-    for i, seg in enumerate(raw):
-        mine = [(a, b, int(wlab[k])) for k, (si, a, b) in enumerate(windows) if si == i]
-        pieces.extend(_split_by_speaker(seg, mine))
+    turns, method = None, ""
+    if _BACKEND == "pyannote":
+        try:
+            turns, method = _pyannote_turns(audio, forced)
+        except Exception as exc:
+            print(f"  ⚠ pyannote diarization failed, using ECAPA: {exc}")
+            method = f"pyannote failed ({type(exc).__name__}) → "
+    if turns:
+        for seg in raw:
+            mine = [t for t in turns if t[1] > seg.start - 0.5 and t[0] < seg.end + 0.5]
+            pieces.extend(_split_by_speaker(seg, mine, by_overlap=True))
+    else:
+        windows = _make_windows(raw)
+        method += "ECAPA windows"
+        try:
+            emb = _embed([audio[int(a * _SR):int(b * _SR)] for _, a, b in windows])
+            wlab = _cluster_windows(emb, windows, forced)
+        except Exception as exc:
+            method = f"fallback: one speaker ({type(exc).__name__})"
+            wlab = np.zeros(len(windows), dtype=int)
+        for i, seg in enumerate(raw):
+            mine = [(a, b, int(wlab[k])) for k, (si, a, b) in enumerate(windows) if si == i]
+            pieces.extend(_split_by_speaker(seg, mine))
     pieces = _renumber_speakers(pieces)
     split_count = len(pieces) - len(raw)
 
@@ -101,8 +126,10 @@ def diarize_node(state: PipelineState) -> dict:
     from .. import bodhan_asr
     from ..cache import get_cache_dir
     asr_note = "  text: Whisper (set BODHAN_TRANSCRIBE_KEY to use Bodhan)"
-    if bodhan_asr.enabled():
-        lang = os.environ.get("SOURCE_LANG") or (segments[0].lang if segments else None)
+    lang = os.environ.get("SOURCE_LANG") or (segments[0].lang if segments else None)
+    asr_note = (f"  text: Whisper large-v3 (source {lang or '?'}; Bodhan re-transcription "
+                "is used only for Indic-language sources)")
+    if bodhan_asr.enabled(lang):
         ok, bad = bodhan_asr.retranscribe(segments, audio, get_cache_dir(state["video_id"]), lang)
         asr_note = (f"  text: Bodhan indic-transcribe on {ok} line(s)"
                     + (f", Whisper kept on {bad} that failed" if bad else ""))
@@ -268,6 +295,113 @@ def _cluster_windows(emb: np.ndarray, windows, forced: int | None) -> np.ndarray
     return labels
 
 
+# ── pyannote ──────────────────────────────────────────────────────────────────
+
+def _load_pyannote():
+    global _pipeline
+    if _pipeline is None:
+        import torch
+        from pyannote.audio import Pipeline
+        tok = os.environ.get("HF_TOKEN") or None
+        try:
+            _pipeline = Pipeline.from_pretrained(_PYANNOTE_MODEL, token=tok)
+        except TypeError:                      # pyannote < 4
+            _pipeline = Pipeline.from_pretrained(_PYANNOTE_MODEL, use_auth_token=tok)
+        if _pipeline is None:
+            raise RuntimeError(f"could not load {_PYANNOTE_MODEL} — HF_TOKEN set and "
+                               "model terms accepted?")
+        if torch.cuda.is_available():
+            _pipeline.to(torch.device("cuda"))
+    return _pipeline
+
+
+def _pyannote_turns(audio: np.ndarray, forced: int | None
+                    ) -> tuple[list[tuple[float, float, int]], str]:
+    """
+    [(start, end, speaker)] from pyannote, run on the Demucs vocals so music
+    and effects cannot pose as a speaker. Exclusive (one speaker at a time)
+    turns are used when the pipeline provides them, since each dubbed line
+    gets exactly one voice.
+    """
+    import torch
+    pipe = _load_pyannote()
+    kwargs = {"num_speakers": forced} if forced else {"max_speakers": _MAX_SPEAKERS}
+    wav = {"waveform": torch.from_numpy(audio[None, :].astype(np.float32)),
+           "sample_rate": _SR}
+    import pyannote.audio
+    if int(pyannote.audio.__version__.split(".")[0]) >= 4:
+        out = pipe(wav, **kwargs)          # embeddings come back on the output
+    else:
+        out = pipe(wav, return_embeddings=True, **kwargs)
+
+    emb = None
+    if isinstance(out, tuple):                 # pyannote 3.x with return_embeddings
+        ann, emb = out
+    elif hasattr(out, "speaker_diarization"):  # pyannote 4.x DiarizeOutput
+        ann = getattr(out, "exclusive_speaker_diarization", None) or out.speaker_diarization
+        emb = getattr(out, "speaker_embeddings", None)
+    else:
+        ann = out
+    labels = list(ann.labels())
+    turns = [(float(seg.start), float(seg.end), labels.index(lab))
+             for seg, _, lab in ann.itertracks(yield_label=True)]
+    if not turns:
+        raise RuntimeError("pyannote found no speech")
+
+    merged = 0
+    if emb is not None and not forced and len(labels) > 1:
+        turns, merged = _merge_same_voice(turns, np.asarray(emb, dtype=np.float32))
+    # Fold speakers with under _TINY_SECS of speech into whoever is talking
+    # around them — a cough or a one-word backchannel is not a cast member.
+    secs: dict[int, float] = {}
+    for a, b, l in turns:
+        secs[l] = secs.get(l, 0.0) + b - a
+    if len(secs) > 1:
+        main = max(secs, key=secs.get)
+        tiny = {l for l, v in secs.items() if v < _TINY_SECS}
+        if tiny and len(tiny) < len(secs):
+            turns = [(a, b, main if l in tiny else l) for a, b, l in turns]
+    note = f"pyannote {_PYANNOTE_MODEL.split('/')[-1]}"
+    if merged:
+        note += f", merged {merged} split voice(s)"
+    return sorted(turns), note
+
+
+def _merge_same_voice(turns, emb: np.ndarray):
+    """
+    Merge pyannote clusters that are the same person: voiceprints nearly
+    identical AND they never overlap in time (two people can talk at once;
+    one person cannot). Similar-sounding different people fail the first
+    test, so they are kept apart.
+    """
+    emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-9)
+    n = emb.shape[0]
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def overlap(i, j):
+        ti = [(a, b) for a, b, l in turns if l == i]
+        tj = [(a, b) for a, b, l in turns if l == j]
+        return sum(max(0.0, min(b1, b2) - max(a1, a2)) for a1, b1 in ti for a2, b2 in tj)
+
+    merged = 0
+    pairs = sorted(((float(emb[i] @ emb[j]), i, j) for i in range(n) for j in range(i + 1, n)
+                    if np.isfinite(emb[i]).all() and np.isfinite(emb[j]).all()), reverse=True)
+    for sim, i, j in pairs:
+        if sim < _PYANNOTE_MERGE_SIM:
+            break
+        ri, rj = find(i), find(j)
+        if ri != rj and overlap(i, j) < 0.5:
+            parent[rj] = ri
+            merged += 1
+    return [(a, b, find(l)) for a, b, l in turns], merged
+
+
 def _forced_speaker_count(state) -> int | None:
     v = state.get("num_speakers") or os.environ.get("NUM_SPEAKERS", "")
     try:
@@ -279,7 +413,13 @@ def _forced_speaker_count(state) -> int | None:
 
 # ── Word-level speaker assignment ─────────────────────────────────────────────
 
-def _split_by_speaker(seg: Segment, wins: list[tuple[float, float, int]]) -> list[Segment]:
+def _split_by_speaker(seg: Segment, wins: list[tuple[float, float, int]],
+                      by_overlap: bool = False) -> list[Segment]:
+    """
+    wins are (start, end, speaker): sliding windows (ECAPA) or diarization
+    turns (pyannote, by_overlap=True — a word goes to the turn it overlaps
+    most, not the nearest window centre).
+    """
     if not wins:
         seg.speaker = 0
         return [seg]
@@ -291,7 +431,21 @@ def _split_by_speaker(seg: Segment, wins: list[tuple[float, float, int]]) -> lis
     def label_at(t: float) -> int:
         return min(wins, key=lambda w: abs((w[0] + w[1]) / 2 - t))[2]
 
-    labs = [label_at((w["start"] + w["end"]) / 2) for w in words]
+    def label_for(w: dict) -> int:
+        a, b = w["start"], w["end"]
+        best, lab = 0.0, None
+        for s0, e0, l in wins:
+            ov = min(b, e0) - max(a, s0)
+            if ov > best:
+                best, lab = ov, l
+        if lab is not None:
+            return lab
+        mid = (a + b) / 2       # word in a gap between turns → nearest turn edge
+        return min(wins, key=lambda x: 0 if x[0] <= mid <= x[1]
+                   else min(abs(mid - x[0]), abs(mid - x[1])))[2]
+
+    labs = ([label_for(w) for w in words] if by_overlap
+            else [label_at((w["start"] + w["end"]) / 2) for w in words])
 
     # Smooth: absorb runs shorter than _MIN_RUN into the longer neighbour run.
     changed = True

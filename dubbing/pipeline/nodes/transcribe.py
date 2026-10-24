@@ -29,8 +29,9 @@ def transcribe_node(state: PipelineState) -> dict:
     compute_type = "float16" if device == "cuda" else "int8"
 
     # Override with WHISPER_MODEL in .env. VRAM at float16: small ~1GB,
-    # medium ~2.5GB, large-v3 ~4.7GB (needs >4GB card; use int8 to halve it).
-    default_size = "small" if device == "cuda" else "tiny"
+    # medium ~2.5GB, large-v3 ~4.7GB. Word timings drive the speaker split and
+    # the lip-sync spans, so on a GPU the most accurate model is worth it.
+    default_size = "large-v3" if device == "cuda" else "tiny"
     model_size = os.environ.get("WHISPER_MODEL", default_size)
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
 

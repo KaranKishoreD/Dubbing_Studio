@@ -39,7 +39,8 @@ def download_node(state: PipelineState) -> dict:
         elif browser:
             ydl_opts["cookiesfrombrowser"] = (browser,)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            info = ydl.extract_info(url, download=True) or {}
+        _save_meta(cache_dir, url, info)
 
     # 16 kHz mono is what ASR wants, but it is phone-call quality. The final
     # mix is built on a separate full-quality copy so the output does not
@@ -60,6 +61,16 @@ def download_node(state: PipelineState) -> dict:
         "audio_hq_path": str(audio_hq),
         "log": state.get("log", []) + [f"✓ Download complete: {video_path.name}"],
     }
+
+
+def _save_meta(cache_dir: Path, url: str, info: dict) -> None:
+    """Title, channel and length for the studio's project card."""
+    import json
+    meta = {"url": url, "title": info.get("title"), "channel": info.get("channel")
+            or info.get("uploader"), "duration": info.get("duration"),
+            "thumbnail": info.get("thumbnail")}
+    (cache_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1),
+                                          encoding="utf-8")
 
 
 def ensure_hq_audio(video_path: Path, cache_dir: Path) -> Path:

@@ -30,7 +30,12 @@ import soundfile as sf
 from ..cache import get_segments_dir
 from ..state import PipelineState, Segment
 
-MAX_STRETCH = float(os.environ.get("MAX_STRETCH", "1.35"))
+# Speed-up the ear does not notice. Lines needing more are rewritten shorter
+# and re-voiced by synthesize_node first, so beyond this is rare.
+MAX_STRETCH = float(os.environ.get("MAX_STRETCH", "1.10"))
+# Last resort for lines that still overrun after rewriting: audibly faster,
+# but better than cutting words off. Only past this is a clip trimmed.
+HARD_MAX_STRETCH = float(os.environ.get("HARD_MAX_STRETCH", "1.25"))
 MIN_RATE = float(os.environ.get("MIN_RATE", "0.90"))
 GAP_GUARD = float(os.environ.get("GAP_GUARD_SECS", "0.08"))
 GAP_BORROW_MAX = float(os.environ.get("GAP_BORROW_MAX_SECS", "3.0"))
@@ -69,7 +74,7 @@ def align_node(state: PipelineState) -> dict:
         if not seg.dubbed_audio:
             continue
         stem = os.path.splitext(os.path.basename(seg.dubbed_audio))[0]
-        out = segs_dir / f"{stem}_fit_{MAX_STRETCH}_{MIN_RATE}.wav"
+        out = segs_dir / f"{stem}_fit_{MAX_STRETCH}_{HARD_MAX_STRETCH}_{MIN_RATE}.wav"
 
         y, sr = _load_trimmed(seg.dubbed_audio)
         dur = len(y) / sr
@@ -84,7 +89,7 @@ def align_node(state: PipelineState) -> dict:
             else:
                 rate, status = 1.0, "fits"
         else:
-            rate = min(need, MAX_STRETCH)
+            rate = min(need, HARD_MAX_STRETCH)
             status = "sped"
 
         if not out.exists():
@@ -96,14 +101,14 @@ def align_node(state: PipelineState) -> dict:
                 y2[-fade:] *= np.linspace(1.0, 0.0, fade)
             sf.write(str(out), y2, sr)
 
-        if need > MAX_STRETCH:
+        if need > HARD_MAX_STRETCH:
             status = "trimmed"
         counts[status] += 1
         seg.aligned_audio = str(out)
 
     note = (
         f"✓ Fitted {sum(counts.values())} clips — {counts['fits']} as-is, "
-        f"{counts['slowed']} slowed, {counts['sped']} sped up (≤{MAX_STRETCH}×), "
+        f"{counts['slowed']} slowed, {counts['sped']} sped up (≤{HARD_MAX_STRETCH}×), "
         f"{counts['trimmed']} trimmed; worst need {worst:.2f}×"
     )
     return {

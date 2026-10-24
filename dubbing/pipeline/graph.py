@@ -63,3 +63,11 @@ EDIT_PIPELINE = _build(
     edges=_SHARED_EDGES,
     nodes=_SHARED_NODES,
 )
+
+# Re-voice: new voice casting only — translations are kept, so it starts at
+# synthesis and re-runs everything downstream of the audio.
+REVOICE_PIPELINE = _build(
+    entry="synthesize",
+    edges=_SHARED_EDGES[1:],
+    nodes={k: v for k, v in _SHARED_NODES.items() if k != "translate"},
+)
