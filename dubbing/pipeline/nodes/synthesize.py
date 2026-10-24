@@ -360,10 +360,11 @@ def synthesize_node(state: PipelineState) -> dict:
     # Lines with English kept in English spelling (Sarvam translation) that a
     # Bodhan voice will read: Bodhan mangles Latin, so it gets a native-script
     # copy. The stored dubbed_text keeps the English spelling.
-    from .translate import transliterate_latin, has_latin
+    from .translate import transliterate_latin, has_latin, BODHAN_LATIN
     speak_text: dict[int, str] = {}
     need = [(s.id, s.dubbed_text) for s in to_synth
-            if not is_sarvam(s.voice) and has_latin(s.dubbed_text) and lang_code != "en"]
+            if not BODHAN_LATIN and not is_sarvam(s.voice)
+            and has_latin(s.dubbed_text) and lang_code != "en"]
     if need:
         speak_text = transliterate_latin(need, lang_code)
 

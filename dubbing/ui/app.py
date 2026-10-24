@@ -98,11 +98,12 @@ DOMAINS = [
 # ── Pipeline stages, as the customer sees them ────────────────────────────────
 FULL_STAGES = [("download", "Download"), ("separate", "Separate"),
                ("transcribe", "Transcribe"), ("diarize", "Speakers"),
+               ("refine", "Clean up"),
                ("translate", "Translate"), ("synthesize", "Voice"),
                ("align", "Fit timing"), ("lipsync", "Lip sync"),
                ("assemble", "Export")]
-EDIT_STAGES = FULL_STAGES[4:]
-REVOICE_STAGES = FULL_STAGES[5:]
+EDIT_STAGES = FULL_STAGES[5:]
+REVOICE_STAGES = FULL_STAGES[6:]
 
 # ── Voice casting ─────────────────────────────────────────────────────────────
 # One row per detected speaker. Six covers interviews and panels; more than
@@ -336,7 +337,8 @@ def _project_html(video_id: str, lang: str | None, segs: list[dict], url: str | 
 def _segments_to_df(segments: list[Segment]) -> list[list]:
     return [
         [s.id, f"{_ts(s.start)}", f"Speaker {(s.speaker or 0) + 1}", voice_label(s.voice),
-         s.text, s.dubbed_text or "—"]
+         ("⚠ " if s.asr_flag == "low" else "＋ " if s.asr_flag == "gap" else "") + s.text,
+         "— (left undubbed)" if s.keep_original else (s.dubbed_text or "—")]
         for s in sorted(segments, key=lambda s: s.start)
     ]
 
@@ -790,7 +792,9 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
             revoice_btn = gr.Button("🔁 Re-voice with this cast", variant="primary")
 
         with gr.Tab("📝 Script"):
-            gr.Markdown("Who says what, original and dubbed. Click a line to revise it.")
+            gr.Markdown("Who says what, original and dubbed. Click a line to revise it.  \n"
+                        "<small>＋ recovered from speech the recogniser first skipped · "
+                        "⚠ transcript uncertain — worth a listen</small>")
             transcript_table = gr.Dataframe(
                 headers=["#", "Time", "Speaker", "Voice", "Original", "Dubbed"],
                 datatype=["number", "str", "str", "str", "str", "str"],

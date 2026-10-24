@@ -157,6 +157,17 @@ def diarize_node(state: PipelineState) -> dict:
             "seconds": round(sum(s.duration for s in segments if s.speaker == spk), 1),
         }
     relabelled = _assign_genders(profiles)
+    gender_note = "pitch"
+    if _GENDER_METHOD == "classifier":
+        try:
+            probs = _classify_genders(audio, segments)
+            for spk, p_f in probs.items():
+                profiles[str(spk)]["gender"] = "female" if p_f > 0.5 else "male"
+                profiles[str(spk)]["p_female"] = round(p_f, 2)
+            relabelled = False
+            gender_note = "voice classifier"
+        except Exception as exc:
+            print(f"  ⚠ gender classifier failed, using pitch: {exc}")
     for seg in segments:
         seg.gender = profiles[str(seg.speaker)]["gender"]
 
@@ -177,6 +188,7 @@ def diarize_node(state: PipelineState) -> dict:
         f"→ {len(segments)} single-speaker lines",
         asr_note,
     ]
+    notes.append(f"  gender from {gender_note}")
     if relabelled:
         notes.append("  (highest-pitched speaker relabelled female by pitch ratio)")
     notes.append("✓ Delivery (vs each speaker's own baseline): "
@@ -473,7 +485,7 @@ def _split_by_speaker(seg: Segment, wins: list[tuple[float, float, int]],
         out.append(Segment(
             id=seg.id, start=round(ws[0]["start"], 3), end=round(ws[-1]["end"], 3),
             text="".join(w["word"] for w in ws).strip(), lang=seg.lang,
-            words=ws, speaker=lab,
+            words=ws, speaker=lab, asr_flag=seg.asr_flag,
         ))
     return out
 
@@ -517,6 +529,49 @@ def _pitch(y: np.ndarray) -> tuple[float, np.ndarray | None, np.ndarray | None]:
     v = f0[voiced & ~np.isnan(f0)]
     v = v[v > _F0_MIN * 1.15]          # frames pinned to the floor are creak/noise
     return (float(np.median(v)) if v.size >= 5 else 0.0), f0, voiced
+
+
+# ── Gender from voice timbre ──────────────────────────────────────────────────
+# Pitch alone mislabels raised voices: a man shouting in a reality-show promo
+# measured 205 Hz and was cast with a female voice. Two wav2vec2 gender
+# classifiers judge timbre instead; each errs on different single lines (one
+# wavers on some women, the other flips a few men), so their average over all
+# of a speaker's lines is used. Pitch stays as the fallback.
+_GENDER_METHOD = os.environ.get("GENDER_METHOD", "classifier").lower()
+_GENDER_MODELS = [m.strip() for m in os.environ.get(
+    "GENDER_MODELS",
+    "prithivMLmods/Common-Voice-Gender-Detection,"
+    "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech").split(",") if m.strip()]
+
+
+def _classify_genders(audio: np.ndarray, segments: list[Segment]) -> dict[int, float]:
+    """{speaker: P(female)} — ensemble mean, weighted by line duration."""
+    import torch
+    from transformers import pipeline
+    clips: dict[int, list[tuple[np.ndarray, float]]] = {}
+    for seg in segments:
+        y = audio[int(seg.start * _SR):int(min(seg.end, seg.start + 12) * _SR)]
+        if len(y) >= _SR * 0.7:
+            clips.setdefault(seg.speaker or 0, []).append((y, seg.duration))
+    if not clips:
+        raise RuntimeError("no line long enough to classify")
+    per_model: list[dict[int, float]] = []
+    device = 0 if _cuda() else -1
+    for name in _GENDER_MODELS:
+        clf = pipeline("audio-classification", model=name, device=device)
+        out = {}
+        for spk, items in clips.items():
+            num = den = 0.0
+            for y, w in items:
+                r = {x["label"].lower(): x["score"] for x in clf({"raw": y, "sampling_rate": _SR})}
+                num += w * r.get("female", 0.0)
+                den += w
+            out[spk] = num / den
+        per_model.append(out)
+        del clf
+        if _cuda():
+            torch.cuda.empty_cache()
+    return {spk: float(np.mean([m[spk] for m in per_model])) for spk in clips}
 
 
 def _assign_genders(profiles: dict[str, dict]) -> bool:

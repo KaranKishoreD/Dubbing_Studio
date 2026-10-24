@@ -567,6 +567,10 @@ _FACE_SAME_SIM = float(os.environ.get("FACE_SAME_SIM", "0.40"))
 # Share of a shot's samples in which the speaker must be the main frontal face.
 _SHOT_FACE_FRAC = float(os.environ.get("SHOT_FACE_FRAC", "0.85"))
 _MIN_SHOT_SECS = float(os.environ.get("MIN_SYNC_SHOT_SECS", "0.4"))
+# Median mouth-region change between samples below which a face is not
+# talking (static photo / freeze-frame). Measured: still image 0.000,
+# talking faces 0.05-0.08.
+_MIN_MOUTH_MOTION = float(os.environ.get("MIN_MOUTH_MOTION", "0.01"))
 
 
 def plan_sync_shots(analysis: dict, segments: list[Segment],
@@ -644,7 +648,14 @@ def plan_sync_shots(analysis: dict, segments: list[Segment],
             # Is the speaker's own face on screen, frontal, through the shot?
             mine = inside[(ident[inside] == face_of[spk]) & frontal[inside]]
             n_frames = max(1, int(round((y - x) * float(analysis["fps"]) / int(analysis["step"]))))
-            if len(np.unique(t[mine])) >= _SHOT_FACE_FRAC * n_frames:
+            # Only a face that is actually talking in the original gets new
+            # lips: a host's photo on an end card, a poster or a freeze-frame
+            # has no mouth motion (0.000 vs ~0.06 for real speech), and a
+            # voice-over across it must not animate it.
+            mm = mouth[mine]
+            mm = mm[np.isfinite(mm)]
+            talking = len(mm) >= 3 and float(np.median(mm)) >= _MIN_MOUTH_MOTION
+            if talking and len(np.unique(t[mine])) >= _SHOT_FACE_FRAC * n_frames:
                 b = bbox[mine]
                 # Where the face sits, so LatentSync syncs this face and not
                 # the larger blurred head of the listener in the foreground.

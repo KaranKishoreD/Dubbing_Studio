@@ -98,11 +98,21 @@ _SCRIPT_LATIN = ('Words that stay English are written in normal English spelling
 SARVAM_LANGS = {"hi", "bn", "ta", "te", "kn", "ml", "mr", "gu", "pa", "or", "en"}
 
 
+# Bodhan reads English words written in English spelling (tested: "first
+# week", "family", "chill" come out as English; preferred by ear over the
+# Tamil-script spelling). BODHAN_LATIN=0 restores Tamil-script spelling.
+BODHAN_LATIN = os.environ.get("BODHAN_LATIN", "1") == "1"
+
+
 def latin_allowed(state) -> bool:
-    """English words may stay in Latin script only when Sarvam voices them."""
+    """May English words stay in English (Latin) spelling for this engine?"""
     code = state["target_lang"].split("-")[0]
-    return ((state.get("tts_backend") or "").lower() == "sarvam"
-            and code in SARVAM_LANGS and bool(os.environ.get("SARVAM_API_KEY")))
+    if code == "en":
+        return False
+    engine = (state.get("tts_backend") or "bodhan").lower()
+    if engine == "sarvam" and code in SARVAM_LANGS and os.environ.get("SARVAM_API_KEY"):
+        return True
+    return BODHAN_LATIN
 
 
 # How much English stays in the dub. Real spoken Tamil/Hindi/… is full of

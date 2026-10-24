@@ -39,13 +39,17 @@ class Segment:
     # Bodhan style that overrides the measured delivery for this line.
     keep_original: bool = False
     style_override: Optional[str] = None
+    # Transcript provenance: "gap" = recovered from speech Whisper skipped,
+    # "low" = refine step is unsure. asr_raw = the text before refinement.
+    asr_flag: Optional[str] = None
+    asr_raw: Optional[str] = None
 
     _FIELDS = {
         "id", "start", "end", "text", "lang", "words",
         "dubbed_text", "dubbed_audio", "aligned_audio",
         "lip_synced_clip", "original_clip", "edit_instruction", "edit_hash",
         "speaker", "gender", "f0", "voice", "delivery", "pace", "asr_alt",
-        "sync_clips", "keep_original", "style_override",
+        "sync_clips", "keep_original", "style_override", "asr_flag", "asr_raw",
     }
 
     @property

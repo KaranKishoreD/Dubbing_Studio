@@ -4,6 +4,7 @@ from .nodes.download import download_node
 from .nodes.separate import separate_node
 from .nodes.transcribe import transcribe_node
 from .nodes.diarize import diarize_node
+from .nodes.refine import refine_node
 from .nodes.translate import translate_node
 from .nodes.synthesize import synthesize_node
 from .nodes.align import align_node
@@ -44,7 +45,8 @@ FULL_PIPELINE = _build(
         ("download", "separate"),
         ("separate", "transcribe"),
         ("transcribe", "diarize"),
-        ("diarize", "translate"),
+        ("diarize", "refine"),
+        ("refine", "translate"),
         *_SHARED_EDGES,
     ],
     nodes={
@@ -52,6 +54,7 @@ FULL_PIPELINE = _build(
         "separate": separate_node,
         "transcribe": transcribe_node,
         "diarize": diarize_node,
+        "refine": refine_node,
         **_SHARED_NODES,
     },
 )
