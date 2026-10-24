@@ -616,21 +616,37 @@ def plan_sync_shots(analysis: dict, segments: list[Segment],
     # motion makes their "mouth" look busy).
     ids = [i for i in set(ident.tolist())
            if i >= 0 and (ident == i).sum() >= 10 and frontal[ident == i].mean() >= 0.5]
+    # A face seen in a handful of frames (a poster, a background extra) can
+    # score a perfect screen-time share by luck; real cast members recur.
+    if ids:
+        top = max((ident == i).sum() for i in ids)
+        ids = [i for i in ids if (ident == i).sum() >= max(10, 0.05 * top)]
     spks = sorted({s.speaker if s.speaker is not None else 0 for s in segments})
     if not ids:
         return {}, "no recurring faces"
 
-    # Score[id][spk]: how much more this face's mouth moves while spk talks
-    # than while anyone else talks.
+    # Score[id][spk] combines two clues:
+    #  - screen time: share of this face's frontal frames that fall while spk
+    #    talks. Decisive in interviews/lectures, where the camera cuts to
+    #    whoever is speaking.
+    #  - lip motion: how much more its mouth moves while spk talks than while
+    #    others do. Decisive in shot/reverse-shot, where the listener is on
+    #    screen as often as the speaker (screen time ≈ 50/50 there).
+    # Lip motion alone swapped the two people in a clean interview (2 of 27
+    # shots synced).
     score = np.zeros((len(ids), len(spks)))
     for a, i in enumerate(ids):
-        m = (ident == i) & np.isfinite(mouth) & frontal
+        f = (ident == i) & frontal & (spk_at >= 0)
+        m = f & np.isfinite(mouth)
         for b, s in enumerate(spks):
-            on, off = m & (spk_at == s), m & (spk_at != s) & (spk_at >= 0)
-            if on.sum() >= 3:
-                score[a, b] = mouth[on].mean() - (mouth[off].mean() if off.sum() >= 3 else 0)
+            share = (f & (spk_at == s)).sum() / max(1, f.sum())
+            on, off = m & (spk_at == s), m & (spk_at != s)
+            lip = 0.0
+            if on.sum() >= 3 and off.sum() >= 3:
+                lip = (mouth[on].mean() - mouth[off].mean()) / (mouth[m].std() + 1e-6)
+            score[a, b] = share + 0.5 * lip
     rows, cols = linear_sum_assignment(-score)
-    face_of = {spks[c]: ids[r] for r, c in zip(rows, cols) if score[r, c] > 0}
+    face_of = {spks[c]: ids[r] for r, c in zip(rows, cols) if score[r, c] > 0.2}
 
     plan: dict[int, list[tuple[float, float]]] = {}
     for seg in segments:
@@ -664,4 +680,4 @@ def plan_sync_shots(analysis: dict, segments: list[Segment],
                 plan.setdefault(seg.id, []).append((round(float(x), 3), round(float(y), 3), cx, cy))
 
     note = ", ".join(f"S{s + 1}→face {face_of[s]}" for s in sorted(face_of))
-    return plan, f"faces matched by lip motion: {note or 'none'}"
+    return plan, f"faces matched by screen time + lip motion: {note or 'none'}"

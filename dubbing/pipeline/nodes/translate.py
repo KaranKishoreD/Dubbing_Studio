@@ -251,6 +251,12 @@ def translate_node(state: PipelineState) -> dict:
     # Shorten anything that cannot be spoken in its slot. Doing this before
     # synthesis is what keeps the dub from sounding hurried — time-stretching
     # can then stay within a range the ear does not notice.
+    if use_llm and _POLISH:
+        polished = native_polish(pending, segments, target_lang, mix, latin_allowed(state))
+        if polished:
+            notes.append(f"✓ Native-speaker polish: {polished} stiff line(s) rewritten "
+                         "to how people actually say it")
+
     shortened = _compress_overlong(segments, state["target_lang"])
     if shortened:
         notes.append(
@@ -499,6 +505,82 @@ def transliterate_latin(items: list[tuple[int, str]], lang_code: str) -> dict[in
 def has_latin(text: str | None) -> bool:
     import re
     return bool(text) and bool(re.search(r"[A-Za-z]", text))
+
+
+# ── Native-speaker polish ─────────────────────────────────────────────────────
+# A faithful translation can still be stiff: "I've been here four years and
+# only recently switched departments" came out as "நாலு வருஷமா இங்க,
+# டிபார்ட்மெண்ட் மாறினேன்" where a Tamil speaker says "நாலு வருஷத்துக்கு
+# அப்புறம் department மாறினேன்". A second pass reads each line as a native
+# speaker would and rewrites only the ones nobody would actually say.
+_POLISH = os.environ.get("NATIVE_POLISH", "1") == "1"
+
+_POLISH_SYSTEM = """\
+You are a native {lang} speaker reviewing a dubbed video's {lang} lines. Each
+line has the original (English) and the current {lang} dub.
+
+For each line ask: would a real {lang} speaker say exactly this, in this
+situation, in everyday speech? If YES, leave it out of your answer. If it is
+stiff, literal, bookish, or phrased the way a translation reads rather than
+the way people talk, rewrite it the way a native speaker would naturally say
+it.
+
+When rewriting:
+1. Keep the full meaning of the ORIGINAL, including nuance (time order,
+   "only recently", who did what, questions vs statements). Keep its
+   connecting words — but, so, because, then, only, also — as their natural
+   spoken {lang} equivalents; dropping "but" changes how the line lands.
+2. Keep the speaker's gender agreement and the conversational register.
+3. English words: {english_rule}
+4. Stay within budget_chars characters (the time the line has).
+5. Do not add jokes, fillers or content that is not in the original.
+
+Return ONLY JSON listing just the lines you changed:
+[{{"id": <int>, "text": "<natural {lang} line>"}}]
+Return [] if every line already sounds natural.
+"""
+
+
+def native_polish(lines: list[Segment], all_segments: list[Segment], target_lang: str,
+                  mix: str, latin: bool) -> int:
+    """Rewrite stiff dubbed lines in place. Returns how many changed."""
+    code = target_lang.split("-")[0]
+    todo = [s for s in lines if s.dubbed_text and not s.keep_original]
+    if not todo or code == "en":
+        return 0
+    lang = LANG_NAMES.get(code, code)
+    budgets = time_budgets(sorted(all_segments, key=lambda s: s.start), target_lang)
+    english_rule = (("keep the English words people really use, written in normal "
+                     "English spelling.") if latin else
+                    (f"keep the English words people really use, written in {lang} script."))
+    if mix == "pure":
+        english_rule = "use English only for names and terms with no common equivalent."
+    system = _POLISH_SYSTEM.format(lang=lang, english_rule=english_rule)
+    changed = 0
+    for i in range(0, len(todo), _CHUNK_LINES):
+        chunk = todo[i:i + _CHUNK_LINES]
+        payload = [{"id": s.id, "gender": s.gender or "unknown", "original": s.text,
+                    "dub": s.dubbed_text, "budget_chars": budgets[s.id][1]} for s in chunk]
+        try:
+            resp = _openrouter_client().chat.completions.create(
+                model=TRANSLATE_MODEL,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                temperature=0.2, timeout=180)
+            items = _parse_items(resp.choices[0].message.content.strip())
+        except Exception as exc:
+            print(f"  ⚠ native polish skipped for a chunk: {exc}")
+            continue
+        by_id = {s.id: s for s in chunk}
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            seg = by_id.get(it.get("id"))
+            text = str(it.get("text") or "").strip()
+            if seg and text and text != seg.dubbed_text and script_ok(text, code, latin):
+                seg.dubbed_text = text
+                changed += 1
+    return changed
 
 
 def condense_to_budget(jobs: list[tuple[int, str, int]]) -> dict[int, str]:

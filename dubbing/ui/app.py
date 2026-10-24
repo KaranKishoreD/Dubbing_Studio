@@ -62,6 +62,7 @@ from pipeline.state import PipelineState, Segment
 from pipeline.cache import video_id_from_url, get_cache_dir, CACHE_ROOT
 from pipeline.graph import FULL_PIPELINE, EDIT_PIPELINE, REVOICE_PIPELINE
 from pipeline.edit_planner import plan_edits, apply_plan
+from pipeline.transcript_edits import parse_corrections, apply_source_edits, table_edits
 from pipeline.nodes.synthesize import (
     BODHAN_STYLES, DEFAULT_STYLE_LABEL, voice_catalogue, preview_voice, voice_profiles,
     voice_label, is_sarvam,
@@ -116,16 +117,18 @@ _PROFILES = voice_profiles()                       # measured pitch per voice
 
 def _choice(v: str, g: str, lang: str) -> tuple[str, str]:
     pitch = _PROFILES.get(v, {}).get("pitch")
-    where = "Sarvam" if is_sarvam(v) else f"Bodhan · {LANG_NAMES.get(lang, lang)}"
-    return (f"{voice_label(v).replace(' (Sarvam)', '')} — {g}"
+    where = ("Sarvam" if is_sarvam(v) else "gpt-audio" if v.startswith("gptaudio:")
+             else f"Bodhan · {LANG_NAMES.get(lang, lang)}")
+    return (f"{voice_label(v).replace(' (Sarvam)', '').replace(' (gpt-audio)', '')} — {g}"
             + (f" · {pitch}" if pitch else "") + f" · {where}", v)
 
 
 _BY_PITCH = sorted(_CATALOGUE, key=lambda x: _PROFILES.get(x[0], {}).get("f0", 0))
 VOICE_CHOICES = [AUTO_VOICE] + [
     _choice(v, g, l)
-    for engine in ("sarvam", "bodhan") for g_order in ("female", "male")
-    for v, g, l in _BY_PITCH if g == g_order and is_sarvam(v) == (engine == "sarvam")
+    for engine in ("gptaudio", "sarvam", "bodhan") for g_order in ("female", "male")
+    for v, g, l in _BY_PITCH if g == g_order and
+    ("gptaudio" if v.startswith("gptaudio:") else "sarvam" if is_sarvam(v) else "bodhan") == engine
 ]
 _HAS_SARVAM = bool(os.environ.get("SARVAM_API_KEY"))
 
@@ -337,7 +340,8 @@ def _project_html(video_id: str, lang: str | None, segs: list[dict], url: str | 
 def _segments_to_df(segments: list[Segment]) -> list[list]:
     return [
         [s.id, f"{_ts(s.start)}", f"Speaker {(s.speaker or 0) + 1}", voice_label(s.voice),
-         ("⚠ " if s.asr_flag == "low" else "＋ " if s.asr_flag == "gap" else "") + s.text,
+         ("⚠ " if s.asr_flag == "low" else "＋ " if s.asr_flag == "gap"
+          else "✎ " if s.asr_flag == "edited" else "") + s.text,
          "— (left undubbed)" if s.keep_original else (s.dubbed_text or "—")]
         for s in sorted(segments, key=lambda s: s.start)
     ]
@@ -740,13 +744,14 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
                 value="standard", label="English in the dub",
                 info="How many English words stay, the way real speakers talk")
             tts_engine = gr.Radio(
-                choices=[("Bodhan Indic-Speak", "bodhan"), ("Sarvam Bulbul v3", "sarvam")],
+                choices=[("Bodhan Indic-Speak", "bodhan"), ("Sarvam Bulbul v3", "sarvam"),
+                         ("gpt-audio (natural English words)", "gptaudio")],
                 value="bodhan", label="Voice engine",
                 info=("Sarvam: 11 languages (hi bn ta te kn ml mr gu pa or en) — other "
                       "languages use Bodhan automatically. Any voice can still be picked "
                       "per speaker in Cast" if _HAS_SARVAM else
                       "Add SARVAM_API_KEY to .env to enable Sarvam"),
-                interactive=_HAS_SARVAM)
+                interactive=True)
             with gr.Accordion("Advanced", open=False):
                 domain = gr.Dropdown(choices=DOMAINS, value="education / lecture",
                                      label="Content domain (keeps technical terms)")
@@ -792,14 +797,24 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
             revoice_btn = gr.Button("🔁 Re-voice with this cast", variant="primary")
 
         with gr.Tab("📝 Script"):
-            gr.Markdown("Who says what, original and dubbed. Click a line to revise it.  \n"
+            gr.Markdown("Who says what, original and dubbed. **Click an Original cell to "
+                        "correct what was said**, or describe the fix below.  \n"
                         "<small>＋ recovered from speech the recogniser first skipped · "
-                        "⚠ transcript uncertain — worth a listen</small>")
+                        "⚠ transcript uncertain — worth a listen · ✎ corrected by you</small>")
             transcript_table = gr.Dataframe(
                 headers=["#", "Time", "Speaker", "Voice", "Original", "Dubbed"],
                 datatype=["number", "str", "str", "str", "str", "str"],
-                interactive=False, wrap=True, column_widths=["5%", "8%", "10%", "9%", "34%", "34%"],
+                interactive=True, static_columns=[0, 1, 2, 3, 5], wrap=True,
+                column_widths=["5%", "8%", "10%", "9%", "34%", "34%"],
             )
+            with gr.Row():
+                fix_input = gr.Textbox(
+                    label="Describe a transcript correction (optional)", scale=5, lines=1,
+                    placeholder="e.g. at 0:25 it's “Maruti Suzuki”, not “Baruti”; "
+                                "line 4 says “Jason”, not “Jaison”")
+                fix_btn = gr.Button("Find lines →", scale=1, min_width=130)
+            fix_status = gr.Markdown("")
+            save_transcript_btn = gr.Button("💾 Re-dub corrected lines", variant="primary")
 
         with gr.Tab("✏️ Revise"):
             gr.Markdown("Ask for any number of changes in one message — wording, tone, "
@@ -1033,6 +1048,68 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
     ).then(lambda b, a: ("#### What changed\n" + _diff_md(b, a)) if b and a else "",
            inputs=[before_edit_state, segments_state], outputs=[diff_md],
            show_progress="hidden")
+
+    # ── Transcript corrections ────────────────────────────────────────────────
+    def _on_find_fix(msg, segs, rows):
+        if not segs:
+            return gr.update(), "⚠ Dub a video first."
+        if not (msg or "").strip():
+            return gr.update(), "⚠ Describe what is wrong in the transcript."
+        try:
+            fixes = parse_corrections(msg.strip(), [Segment.from_dict(d) for d in segs])
+        except Exception as e:
+            print(f"✗ Transcript correction parse failed: {e}", flush=True)
+            return gr.update(), f"✗ Could not interpret that: {e}"
+        if not fixes:
+            return gr.update(), "⚠ No line matched that description."
+        # Keep the user's own unsaved cell edits, then layer the new fixes on.
+        pending = table_edits(rows, segs)
+        pending.update(fixes)
+        preview = [Segment.from_dict(d) for d in segs]
+        for sobj in preview:
+            if sobj.id in pending:
+                sobj.text, sobj.asr_flag = pending[sobj.id], "edited"
+        changed = ", ".join(f"S{i}" for i in sorted(fixes))
+        return (_segments_to_df(preview),
+                f"✓ Proposed corrections for {changed} (marked ✎ in the table). Check them, "
+                "then **Re-dub corrected lines**.")
+
+    fix_btn.click(lambda: "⏳ Finding the lines…", outputs=[fix_status], queue=False,
+                  show_progress="hidden").then(
+        _on_find_fix, inputs=[fix_input, segments_state, transcript_table],
+        outputs=[transcript_table, fix_status], show_progress="hidden")
+
+    def _on_save_transcript(rows, segs, vid_id, lang, dom, vname, vstyle, mix, engine, *voices):
+        none = [gr.update()] * (len(run_outputs) - 2)
+        edits = table_edits(rows, segs or [])
+        if not segs:
+            yield ("**⚠ Dub a video first.**", gr.update(), *none)
+            return
+        if not edits:
+            yield ("**⚠ No transcript changes to re-dub** — edit an Original cell first.",
+                   gr.update(), *none)
+            return
+        new_segs, changed = apply_source_edits(segs, edits)
+        state = _cached_state(vid_id, SUPPORTED_LANGS.get(lang, "hi"), dom, vname,
+                              BODHAN_STYLES.get(vstyle, "educational lecture"),
+                              _voice_map(*voices), new_segs, [], mix, engine)
+        if isinstance(state, str):
+            yield (f"**{state}**", gr.update(), *none)
+            return
+        print(f"\n=== Transcript corrections {vid_id}: {edits}", flush=True)
+        yield from _drive(_stream(EDIT_PIPELINE, state, EDIT_STAGES), EDIT_STAGES,
+                          "Re-dubbing corrected lines",
+                          lambda info, tr: _finished(
+                              info, tr, "Re-dubbed " + ", ".join(f"S{i}" for i in changed)))
+
+    save_transcript_btn.click(
+        _queued, outputs=[status_md], queue=False, show_progress="hidden",
+    ).then(
+        _on_save_transcript,
+        inputs=[transcript_table, segments_state, video_id_state, target_lang, domain,
+                voice_name_input, voice_style_dropdown, lang_mix, tts_engine, *cast_voices],
+        outputs=run_outputs, show_progress="minimal", show_progress_on=[status_md],
+    ).then(_after_run, inputs=after_inputs, outputs=after_outputs, show_progress="hidden")
 
     # Script row click → pre-fill a change request for that line
     def _on_row_select(evt: gr.SelectData, segs):

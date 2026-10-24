@@ -111,10 +111,53 @@ def align_node(state: PipelineState) -> dict:
         f"{counts['slowed']} slowed, {counts['sped']} sped up (≤{HARD_MAX_STRETCH}×), "
         f"{counts['trimmed']} trimmed; worst need {worst:.2f}×"
     )
+    notes = [note]
+    adapt_note = _voice_adapt(segments, state, segs_dir)
+    if adapt_note:
+        notes.append(adapt_note)
     return {
         "segments": [s.to_dict() for s in segments],
-        "log": state.get("log", []) + [note],
+        "log": state.get("log", []) + notes,
     }
+
+
+def _voice_adapt(segments: list[Segment], state: PipelineState, segs_dir) -> str:
+    """Pitch / loudness / mic-colour matching of each fitted clip (voice_adapt.py)."""
+    from .. import voice_adapt as va
+    vocals_path = state.get("vocals_path")
+    if not va.ENABLED or not vocals_path or not os.path.exists(vocals_path):
+        return ""
+    try:
+        voc, vsr = sf.read(vocals_path, dtype="float32", always_2d=True)
+        voc = voc.mean(axis=1)
+        models = va.build_models(segments, voc, vsr)
+        # What each speaker's DUB voice is like, from all their fitted clips.
+        by_spk: dict[int, list[np.ndarray]] = {}
+        sr0 = None
+        for s in segments:
+            if s.aligned_audio and os.path.exists(s.aligned_audio):
+                y, sr0 = sf.read(s.aligned_audio, dtype="float32", always_2d=True)
+                by_spk.setdefault(s.speaker or 0, []).append(y.mean(axis=1))
+        dub = {spk: (va._ltas(c, sr0), va._median_f0(np.concatenate(c), sr0))
+               for spk, c in by_spk.items()}
+        shifted = 0
+        for s in segments:
+            if not s.aligned_audio or not os.path.exists(s.aligned_audio):
+                continue
+            spk = s.speaker or 0
+            stem = os.path.splitext(os.path.basename(s.aligned_audio))[0]
+            out = segs_dir / f"{stem}_va.wav"
+            if not out.exists():
+                y, sr = sf.read(s.aligned_audio, dtype="float32", always_2d=True)
+                y2, info = va.adapt(y.mean(axis=1), sr, s, models[spk], *dub[spk])
+                sf.write(str(out), y2, sr)
+                shifted += int("pitch_st" in info)
+            s.aligned_audio = str(out)
+        return (f"✓ Voice adapted to each speaker (pitch ≤±{va._MAX_ST:g} st, loudness, "
+                f"mic colour)")
+    except Exception as exc:
+        print(f"  ⚠ voice adaptation skipped: {exc}")
+        return "⚠ Voice adaptation skipped (see Server output)"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
