@@ -178,7 +178,7 @@ def analyze(video_path: str, out_path: str) -> None:
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    rows = {"t": [], "bbox": [], "score": [], "frontal": [], "mouth": [], "emb": []}
+    rows = {"t": [], "bbox": [], "score": [], "frontal": [], "yaw": [], "mouth": [], "emb": []}
     prev_mouths: list[tuple[np.ndarray, np.ndarray]] = []   # (emb, mouth crop) last sample
     i = 0
     while True:
@@ -217,6 +217,7 @@ def analyze(video_path: str, out_path: str) -> None:
             rows["bbox"].append(f.bbox.astype(np.float32))
             rows["score"].append(float(f.det_score))
             rows["frontal"].append(bool(yaw < 0.35))
+            rows["yaw"].append(float(yaw))
             rows["mouth"].append(motion)
             rows["emb"].append(emb)
         prev_mouths = cur_mouths
@@ -226,6 +227,7 @@ def analyze(video_path: str, out_path: str) -> None:
         out_path, t=np.array(rows["t"], np.float32),
         bbox=np.array(rows["bbox"], np.float32).reshape(-1, 4),
         score=np.array(rows["score"], np.float32), frontal=np.array(rows["frontal"]),
+        yaw=np.array(rows["yaw"], np.float32),
         mouth=np.array(rows["mouth"], np.float32),
         emb=np.array(rows["emb"], np.float32).reshape(-1, 512),
         cuts=np.array(cuts, np.float32), fps=np.float32(fps), step=np.int32(step))

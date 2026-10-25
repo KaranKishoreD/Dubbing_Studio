@@ -323,7 +323,11 @@ def _load_pyannote():
             raise RuntimeError(f"could not load {_PYANNOTE_MODEL} — HF_TOKEN set and "
                                "model terms accepted?")
         if torch.cuda.is_available():
-            _pipeline.to(torch.device("cuda"))
+            try:
+                _pipeline.to(torch.device("cuda"))
+            except Exception as exc:          # GPU full (shared server) → CPU
+                print(f"  ⚠ GPU full — speaker detection on CPU (slower): {exc}"[:200], flush=True)
+                _pipeline.to(torch.device("cpu"))
     return _pipeline
 
 
@@ -558,7 +562,10 @@ def _classify_genders(audio: np.ndarray, segments: list[Segment]) -> dict[int, f
     per_model: list[dict[int, float]] = []
     device = 0 if _cuda() else -1
     for name in _GENDER_MODELS:
-        clf = pipeline("audio-classification", model=name, device=device)
+        try:
+            clf = pipeline("audio-classification", model=name, device=device)
+        except Exception:                      # GPU full (shared server) → CPU
+            clf = pipeline("audio-classification", model=name, device=-1)
         out = {}
         for spk, items in clips.items():
             num = den = 0.0

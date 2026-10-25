@@ -38,8 +38,21 @@ def download_node(state: PipelineState) -> dict:
             ydl_opts["cookiefile"] = cookie_file
         elif browser:
             ydl_opts["cookiesfrombrowser"] = (browser,)
+        # Part of the video only: yt-dlp fetches just that range (cut on exact
+        # frames), so a 49 s clip of a 30 min video downloads 49 s.
+        start, end = state.get("clip_start"), state.get("clip_end")
+        if start is not None or end is not None:
+            from yt_dlp.utils import download_range_func
+            ydl_opts["download_ranges"] = download_range_func(
+                None, [(start or 0.0, end if end is not None else float("inf"))])
+            ydl_opts["force_keyframes_at_cuts"] = True
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True) or {}
+        if start is not None or end is not None:
+            info = dict(info)
+            full = info.get("duration") or 0
+            info["duration"] = (end if end is not None else full) - (start or 0)
+            info["title"] = f"{info.get('title') or ''} [{_ts(start or 0)}–{_ts(end) if end is not None else 'end'}]"
         _save_meta(cache_dir, url, info)
 
     # 16 kHz mono is what ASR wants, but it is phone-call quality. The final
@@ -61,6 +74,10 @@ def download_node(state: PipelineState) -> dict:
         "audio_hq_path": str(audio_hq),
         "log": state.get("log", []) + [f"✓ Download complete: {video_path.name}"],
     }
+
+
+def _ts(t: float) -> str:
+    return f"{int(t) // 60}:{int(t) % 60:02d}"
 
 
 def _save_meta(cache_dir: Path, url: str, info: dict) -> None:

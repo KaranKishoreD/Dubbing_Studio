@@ -71,9 +71,18 @@ def _whisper():
     # the lip-sync spans, so on a GPU the most accurate model is worth it.
     model_size = os.environ.get("WHISPER_MODEL", "large-v3" if device == "cuda" else "tiny")
     if _model is None:
-        _model = WhisperModel(model_size, device=device,
-                              compute_type="float16" if device == "cuda" else "int8")
-    return _model, model_size, device
+        try:
+            _model = WhisperModel(model_size, device=device,
+                                  compute_type="float16" if device == "cuda" else "int8")
+        except RuntimeError as exc:
+            if device != "cuda" or "out of memory" not in str(exc).lower():
+                raise
+            # The GPU is shared with other users' jobs; when it is full, run
+            # on the CPU (slower) instead of failing the whole dub.
+            print("  ⚠ GPU full — Whisper running on CPU (slower)", flush=True)
+            device = "cpu"
+            _model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    return _model, model_size, getattr(_model.model, "device", device)
 
 
 # ── Gap filling ───────────────────────────────────────────────────────────────

@@ -32,3 +32,13 @@ def video_id_from_url(url: str) -> str:
         if m:
             return m.group(1)
     return hashlib.md5(url.encode()).hexdigest()[:11]
+
+
+def clip_id(video_id: str, start: float | None, end: float | None) -> str:
+    """Project id for part of a video: each range gets its own cache, so a
+    0:00–0:49 dub never reuses a full-length transcript or vice versa."""
+    if start is None and end is None:
+        return video_id
+    a = f"{start:g}" if start is not None else "0"
+    b = f"{end:g}" if end is not None else "end"
+    return f"{video_id}_{a}-{b}"

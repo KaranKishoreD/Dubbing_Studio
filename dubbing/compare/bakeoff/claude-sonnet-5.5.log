@@ -1,0 +1,7 @@
+  ⚠ review skipped for a chunk: 'NoneType' object has no attribute 'strip'
+  ⚠ length fit skipped: Model did not return parseable JSON. First 300 chars:
+[
+{"id":0,"concise":"ஹாய் லாரன்ஸ், Happy Monday!","natural":"ஹாய் லாரன்ஸ், Happy Monday!","full":"ஹாய் லாரன்ஸ், உனக்கு Happy Monday!"},
+{"id":1,"concise":"உனக்கும் Happy Monday!","natural":"உனக்கும் Monday வாழ்த்துகள்!","full":"நீ என்ன சொன்னாலும் சரி, உனக்கும் Happy Monday!"},
+{"id":2,"concise":"wee
+claude-sonnet-5.5 done 157 s 0.2619 USD 19 /25 inside

@@ -227,6 +227,24 @@ def _free_gpu_gb() -> float:
         return 0.0
 
 
+_WAIT_SECS = float(os.environ.get("LATENTSYNC_WAIT_SECS", "600"))
+
+
+def _wait_for_gpu(need_gb: float) -> float:
+    """Poll free GPU memory every 15 s until `need_gb` is free or the wait
+    runs out. Returns the last free amount."""
+    import time
+    deadline = time.time() + _WAIT_SECS
+    free = _free_gpu_gb()
+    if free < need_gb:
+        print(f"  LatentSync: waiting for GPU memory ({free:.1f} GB free, need "
+              f"{need_gb:.1f}) — another job is using the GPU", flush=True)
+    while free < need_gb and time.time() < deadline:
+        time.sleep(15)
+        free = _free_gpu_gb()
+    return free
+
+
 def _run_parallel(jobs: list[dict], pending: list, cache_dir: Path) -> tuple[dict, int]:
     """
     Render with as many LatentSync workers as free GPU memory allows (at
@@ -234,7 +252,15 @@ def _run_parallel(jobs: list[dict], pending: list, cache_dir: Path) -> tuple[dic
     least-loaded worker so all workers finish at about the same time.
     """
     import json
-    free = _free_gpu_gb()
+    import time
+    # The GPU is shared with other users' jobs on this server: wait (up to
+    # LATENTSYNC_WAIT_SECS) until one worker fits instead of failing every shot.
+    free = _wait_for_gpu(_WORKER_GB + _GPU_RESERVE_GB)
+    if free < _WORKER_GB + _GPU_RESERVE_GB:
+        print(f"  ⚠ LatentSync: GPU busy with another job ({free:.1f} GB free, need "
+              f"{_WORKER_GB + _GPU_RESERVE_GB:.1f}) — lip sync skipped, original frames kept",
+              flush=True)
+        return {j["out"]: "error: GPU busy with another job" for j in jobs}, 0
     n = max(1, min(_MAX_WORKERS, int((free - _GPU_RESERVE_GB) // _WORKER_GB), len(jobs)))
     print(f"  LatentSync: {free:.1f} GB GPU free → {n} worker(s) for {len(jobs)} shot(s)",
           flush=True)
@@ -261,6 +287,28 @@ def _run_parallel(jobs: list[dict], pending: list, cache_dir: Path) -> tuple[dic
     for proc, log, rp in procs:
         proc.wait()
         log.close()
+        try:
+            results.update(json.loads(rp.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+
+    # GPU memory can be taken by something else after the workers were sized
+    # (e.g. the studio loading its models). Shots that failed for lack of
+    # memory are retried once, one at a time, instead of silently keeping
+    # their original frames.
+    oom = [j for j in jobs if any(k in str(results.get(j["out"], "missing"))
+                                  for k in ("Failed to al", "out of memory", "CUDA error",
+                                            "missing"))]
+    if oom and _wait_for_gpu(_WORKER_GB + _GPU_RESERVE_GB) >= _WORKER_GB + _GPU_RESERVE_GB:
+        print(f"  LatentSync: retrying {len(oom)} shot(s) that ran out of GPU memory, "
+              "one worker", flush=True)
+        jp, rp = cache_dir / "latentsync_jobs_retry.json", cache_dir / "latentsync_results_retry.json"
+        jp.write_text(json.dumps(oom), encoding="utf-8")
+        rp.unlink(missing_ok=True)
+        with open(cache_dir / "latentsync_retry.log", "w") as log:
+            subprocess.run([str(_LS_PYTHON.absolute()), str(_WORKER), str(jp.resolve()),
+                            str(rp.resolve())], cwd=str(LATENTSYNC_DIR), stdout=log,
+                           stderr=subprocess.STDOUT)
         try:
             results.update(json.loads(rp.read_text(encoding="utf-8")))
         except Exception:
@@ -565,7 +613,12 @@ def _extract_clip(video_path: str, out_path: str, start: float, end: float) -> N
 # Same person if face embeddings (ArcFace) are at least this similar.
 _FACE_SAME_SIM = float(os.environ.get("FACE_SAME_SIM", "0.40"))
 # Share of a shot's samples in which the speaker must be the main frontal face.
-_SHOT_FACE_FRAC = float(os.environ.get("SHOT_FACE_FRAC", "0.85"))
+_SHOT_FACE_FRAC = float(os.environ.get("SHOT_FACE_FRAC", "0.75"))
+# Yaw proxy = nose offset from the eye midpoint / eye distance. ~0.35 ≈ 20°,
+# ~0.7 ≈ 40° (three-quarter view).
+_MAX_YAW = float(os.environ.get("LIPSYNC_MAX_YAW", "0.7"))
+# Share of a person's detections that must be usable to be a candidate.
+_MIN_USABLE = float(os.environ.get("LIPSYNC_MIN_USABLE", "0.3"))
 _MIN_SHOT_SECS = float(os.environ.get("MIN_SYNC_SHOT_SECS", "0.4"))
 # Median mouth-region change between samples below which a face is not
 # talking (static photo / freeze-frame). Measured: still image 0.000,
@@ -585,7 +638,12 @@ def plan_sync_shots(analysis: dict, segments: list[Segment],
     from sklearn.cluster import AgglomerativeClustering
     from scipy.optimize import linear_sum_assignment
 
-    t, bbox, frontal = analysis["t"], analysis["bbox"], analysis["frontal"]
+    t, bbox = analysis["t"], analysis["bbox"]
+    # "Usable" face = turned at most _MAX_YAW. The old frontal test (~20°)
+    # rejected every face in a studio interview shot at three-quarter angles
+    # (frontal 0–26% of the time), so nothing was synced; LatentSync aligns
+    # faces by landmarks and handles three-quarter views.
+    frontal = (analysis["yaw"] < _MAX_YAW) if "yaw" in analysis else analysis["frontal"]
     mouth, emb, cuts = analysis["mouth"], analysis["emb"], list(analysis["cuts"])
     if len(t) == 0:
         return {}, "no faces in the video"
@@ -615,7 +673,7 @@ def plan_sync_shots(analysis: dict, segments: list[Segment],
     # over-the-shoulder heads in a reverse shot are not candidates (and camera
     # motion makes their "mouth" look busy).
     ids = [i for i in set(ident.tolist())
-           if i >= 0 and (ident == i).sum() >= 10 and frontal[ident == i].mean() >= 0.5]
+           if i >= 0 and (ident == i).sum() >= 10 and frontal[ident == i].mean() >= _MIN_USABLE]
     # A face seen in a handful of frames (a poster, a background extra) can
     # score a perfect screen-time share by luck; real cast members recur.
     if ids:

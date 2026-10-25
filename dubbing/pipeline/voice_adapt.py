@@ -23,12 +23,17 @@ import os
 import numpy as np
 
 ENABLED = os.environ.get("VOICE_ADAPT", "1") == "1"
-_PITCH = os.environ.get("VA_PITCH", "1") == "1"
+# Off by default: Praat "Change gender" re-synthesises the whole clip and
+# sounded doubled/unstable on long lines. Pitch-matched casting already picks
+# a voice near the speaker, so no resynthesis is needed.
+_PITCH = os.environ.get("VA_PITCH", "0") == "1"
 _LOUD = os.environ.get("VA_LOUDNESS", "1") == "1"
 _EQ = os.environ.get("VA_EQ", "1") == "1"
 # ±2 st sounded processed on a male voice (+2.0 needed); +0.8 on a female
 # voice sounded natural. Larger gaps are a casting problem, not a pitch one.
-_MAX_ST = float(os.environ.get("VA_MAX_SEMITONES", "1"))
+# Pitch and formants move together now (Praat), so a little more range is
+# natural; pitch-matched casting keeps most shifts small anyway.
+_MAX_ST = float(os.environ.get("VA_MAX_SEMITONES", "1.5"))
 _MAX_GAIN = float(os.environ.get("VA_MAX_GAIN_DB", "6"))
 _MAX_EQ = float(os.environ.get("VA_MAX_EQ_DB", "6"))
 _SR = 16000          # analysis rate
@@ -111,8 +116,7 @@ def adapt(y: np.ndarray, sr: int, seg, model: SpeakerModel, dub_ltas: np.ndarray
     if _PITCH and model.f0 and dub_f0:
         st = float(np.clip(12 * np.log2(model.f0 / dub_f0), -_MAX_ST, _MAX_ST))
         if abs(st) >= 0.25:
-            import pyrubberband as pyrb
-            y = pyrb.pitch_shift(y, sr, st).astype(np.float32)
+            y = _change_voice(y, sr, dub_f0 * 2 ** (st / 12), st)
             info["pitch_st"] = round(st, 2)
     if _EQ and model.ltas is not None and dub_ltas is not None:
         y = _apply_eq(y, sr, model.ltas - dub_ltas)
@@ -126,6 +130,27 @@ def adapt(y: np.ndarray, sr: int, seg, model: SpeakerModel, dub_ltas: np.ndarray
     if peak > 0.99:
         y = y * (0.99 / peak)
     return y.astype(np.float32), info
+
+
+def _change_voice(y: np.ndarray, sr: int, new_median_f0: float, st: float) -> np.ndarray:
+    """
+    Move pitch AND formants together (Praat "Change gender"). A plain
+    semitone shift keeps the formants, which is what made a +2 st male voice
+    sound processed; real voices that sit higher or lower also resonate
+    higher or lower. Formants move about a quarter as much as pitch, ±7% max.
+    Falls back to rubberband if Praat is unavailable.
+    """
+    try:
+        import parselmouth
+        from parselmouth.praat import call
+        snd = parselmouth.Sound(y.astype(np.float64), sampling_frequency=sr)
+        formant_ratio = float(np.clip(2 ** (st / 12 * 0.25), 0.93, 1.07))
+        out = call(snd, "Change gender", 60, 500, formant_ratio, new_median_f0, 1.0, 1.0)
+        z = out.values[0].astype(np.float32)
+        return z[:len(y)] if len(z) >= len(y) else np.pad(z, (0, len(y) - len(z)))
+    except Exception:
+        import pyrubberband as pyrb
+        return pyrb.pitch_shift(y, sr, st).astype(np.float32)
 
 
 def _apply_eq(y: np.ndarray, sr: int, diff_db: np.ndarray) -> np.ndarray:

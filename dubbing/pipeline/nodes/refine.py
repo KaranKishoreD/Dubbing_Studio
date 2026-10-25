@@ -28,8 +28,7 @@ import os
 from ..cache import get_cache_dir
 from ..state import PipelineState, Segment
 
-REFINE_MODEL = os.environ.get("REFINE_MODEL", os.environ.get("TRANSLATE_MODEL",
-                                                             "anthropic/claude-sonnet-5.5"))
+REFINE_MODEL = os.environ.get("REFINE_MODEL", "google/gemini-3.8-flash")
 _ENABLED = os.environ.get("REFINE_TRANSCRIPT", "1") == "1"
 _CHUNK = 40
 
@@ -71,6 +70,21 @@ def refine_node(state: PipelineState) -> dict:
     cache_dir = get_cache_dir(state["video_id"])
     title = _title(cache_dir)
     ordered = sorted(segments, key=lambda s: s.start)
+    # Only lines that need it: recovered gaps, junk, or where the two
+    # recognisers clearly disagree. Agreeing transcripts are kept as they are.
+    import difflib
+    def needs(s):
+        if s.asr_flag == "gap":
+            return True
+        t = "".join(s.text.split())
+        if len(t) > 6 and len(set(t)) <= 3:
+            return True
+        if s.asr_alt and s.asr_alt != s.text:
+            return difflib.SequenceMatcher(None, s.text.lower(), s.asr_alt.lower()).ratio() < 0.6
+        return False
+    todo_ids = {s.id for s in ordered if needs(s)}
+    if not todo_ids:
+        return {"log": log + ["✓ Transcript: recognisers agree on every line — no clean-up needed"]}
     lines = [{"id": s.id, "time": f"{s.start:.1f}-{s.end:.1f}",
               "speaker": (s.speaker or 0) + 1, "text": s.text,
               **({"alt": s.asr_alt} if s.asr_alt and s.asr_alt != s.text else {})}
@@ -84,9 +98,10 @@ def refine_node(state: PipelineState) -> dict:
         how = "cached"
     else:
         result = {}
-        for i in range(0, len(lines), _CHUNK):
+        edit = [l for l in lines if l["id"] in todo_ids]
+        for i in range(0, len(edit), _CHUNK):
             try:
-                result.update(_call(title, lines, lines[i:i + _CHUNK]))
+                result.update(_call(title, lines, edit[i:i + _CHUNK]))
             except Exception as exc:
                 print(f"  ⚠ transcript refinement failed for lines {i}+: {exc}")
         if result:
@@ -124,10 +139,9 @@ def refine_node(state: PipelineState) -> dict:
 
 
 def _call(title: str, all_lines: list[dict], chunk: list[dict]) -> dict[int, dict]:
-    from openai import OpenAI
+    from .. import llm_budget
     from ..edit_resolver import extract_json_array
-    client = OpenAI(base_url="https://openrouter.ai/api/v1",
-                    api_key=os.environ["OPENROUTER_API_KEY"])
+    client = llm_budget.client()
     ids = {l["id"] for l in chunk}
     context = [l for l in all_lines if l["id"] not in ids]
     payload = {"video_title": title, "lines_to_edit": chunk,
@@ -136,7 +150,7 @@ def _call(title: str, all_lines: list[dict], chunk: list[dict]) -> dict[int, dic
         model=REFINE_MODEL,
         messages=[{"role": "system", "content": _SYSTEM},
                   {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-        temperature=0.0, timeout=180,
+        temperature=0.0, timeout=180, max_tokens=12000,
     )
     items = extract_json_array(resp.choices[0].message.content.strip())
     return {int(it["id"]): it for it in items

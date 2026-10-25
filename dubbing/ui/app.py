@@ -59,7 +59,7 @@ sys.stderr = _Tee(sys.stderr, _log_fh)
 
 import gradio as gr
 from pipeline.state import PipelineState, Segment
-from pipeline.cache import video_id_from_url, get_cache_dir, CACHE_ROOT
+from pipeline.cache import video_id_from_url, get_cache_dir, CACHE_ROOT, clip_id
 from pipeline.graph import FULL_PIPELINE, EDIT_PIPELINE, REVOICE_PIPELINE
 from pipeline.edit_planner import plan_edits, apply_plan
 from pipeline.transcript_edits import parse_corrections, apply_source_edits, table_edits
@@ -153,10 +153,15 @@ _PREVIEW_TEXT = {
 # ── Pipeline state ────────────────────────────────────────────────────────────
 
 def _base_state(video_id, target_lang, domain, voice_name, voice_style, voice_map,
-                lang_mix: str = "standard", tts_backend: str = "bodhan") -> PipelineState:
+                lang_mix: str = "standard", tts_backend: str = "bodhan",
+                translator: str = "indic") -> PipelineState:
+    # Indic mode is Bodhan end to end: its translation AND its voices.
+    if translator == "indic":
+        tts_backend = "bodhan"
     return {
         "lang_mix": lang_mix,
         "tts_backend": tts_backend,
+        "translator": translator,
         "url": "",
         "target_lang": target_lang,
         "domain": domain,
@@ -183,7 +188,7 @@ def _base_state(video_id, target_lang, domain, voice_name, voice_style, voice_ma
 
 def _cached_state(video_id, target_lang, domain, voice_name, voice_style, voice_map,
                   segments_state, edit_ops, lang_mix: str = "standard",
-                  tts_backend: str = "bodhan") -> PipelineState | str:
+                  tts_backend: str = "bodhan", translator: str = "indic") -> PipelineState | str:
     """State for re-running part of the pipeline on a processed video."""
     cache_dir = get_cache_dir(video_id)
     # Prefer the Demucs stems; fall back to the raw-audio copy.
@@ -196,7 +201,7 @@ def _cached_state(video_id, target_lang, domain, voice_name, voice_style, voice_
     if not vocals.exists():
         return "✗ Cache missing — process the video again."
     state = _base_state(video_id, target_lang, domain, voice_name, voice_style, voice_map,
-                        lang_mix, tts_backend)
+                        lang_mix, tts_backend, translator)
     state.update({
         "video_path": str(cache_dir / "video.mp4"),
         "audio_path": str(cache_dir / "audio.wav"),
@@ -391,6 +396,23 @@ def _placeholder_rows(nspk) -> list:
                           visible=k < n),
                 gr.update(visible=k < n), gr.update(visible=k < n)]
     return ups
+
+
+def _parse_time(text) -> float | None:
+    """'49', '0:49', '1:02:03' → seconds; blank → None."""
+    t = str(text or "").strip()
+    if not t:
+        return None
+    try:
+        parts = [float(x) for x in t.split(":")]
+    except ValueError:
+        raise ValueError(f"Can't read the time “{t}” — use m:ss, h:mm:ss or seconds")
+    if len(parts) > 3 or any(p < 0 for p in parts):
+        raise ValueError(f"Can't read the time “{t}” — use m:ss, h:mm:ss or seconds")
+    secs = 0.0
+    for p in parts:
+        secs = secs * 60 + p
+    return secs
 
 
 def _voice_map(*voices) -> dict:
@@ -732,6 +754,11 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
             url_input = gr.Textbox(label="YouTube link",
                                    placeholder="https://www.youtube.com/watch?v=…")
             with gr.Row():
+                clip_start_in = gr.Textbox(label="Start (optional)", placeholder="0:00",
+                                           info="m:ss, h:mm:ss or seconds")
+                clip_end_in = gr.Textbox(label="End (optional)", placeholder="blank = to the end",
+                                         info="Only this part is downloaded and dubbed")
+            with gr.Row():
                 target_lang = gr.Dropdown(choices=list(SUPPORTED_LANGS.keys()),
                                           value="Hindi (हिन्दी)", label="Dub into")
                 num_speakers_dropdown = gr.Dropdown(
@@ -743,6 +770,12 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
                          ("Heavy mix (Tanglish/Hinglish)", "heavy")],
                 value="standard", label="English in the dub",
                 info="How many English words stay, the way real speakers talk")
+            pipeline_mode = gr.Radio(
+                choices=[("LLM translation (context-aware)", "llm"),
+                         ("Indic: Bodhan transcribe → translate → speak, LLM checks", "indic")],
+                value="indic", label="Pipeline",
+                info="Indic uses Bodhan for translation and voices; a top LLM only checks "
+                     "and corrects meaning, gender, naturalness and length")
             tts_engine = gr.Radio(
                 choices=[("Bodhan Indic-Speak", "bodhan"), ("Sarvam Bulbul v3", "sarvam"),
                          ("gpt-audio (natural English words)", "gptaudio")],
@@ -923,17 +956,32 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
                 st.get("final_video"), st.get("final_audio"), _segments_to_df(seg_objs),
                 segs, st.get("video_id"), lang, *_cast_updates(segs))
 
-    def _on_process(url, lang, dom, nspk, vname, vstyle, mix, engine, *voices):
+    def _on_process(cur_vid, url, c_start, c_end, lang, dom, nspk, vname, vstyle, mix, engine,
+                    mode, *voices):
         if not url.strip():
             yield ("**⚠ Paste a YouTube link first.**", _idle_tracker(),
                    *[gr.update()] * (len(run_outputs) - 2))
             return
         code = SUPPORTED_LANGS.get(lang, "hi")
-        vid = video_id_from_url(url.strip())
+        try:
+            a, b = _parse_time(c_start), _parse_time(c_end)
+        except ValueError as e:
+            yield (f"**⚠ {e}**", _idle_tracker(), *[gr.update()] * (len(run_outputs) - 2))
+            return
+        if a is not None and b is not None and b <= a:
+            yield ("**⚠ End must be after Start.**", _idle_tracker(),
+                   *[gr.update()] * (len(run_outputs) - 2))
+            return
+        vid = clip_id(video_id_from_url(url.strip()), a, b)
+        # Cast picks belong to the video they were made for. Carried over to
+        # a new video they overrode automatic casting — a woman got the
+        # previous video's male voice although she was detected as female.
+        vmap = _voice_map(*voices) if vid == cur_vid else {}
         state = _base_state(vid, code, dom, vname,
-                            BODHAN_STYLES.get(vstyle, "educational lecture"), _voice_map(*voices),
-                            mix, engine)
+                            BODHAN_STYLES.get(vstyle, "educational lecture"), vmap,
+                            mix, engine, mode)
         state["url"] = url.strip()
+        state["clip_start"], state["clip_end"] = a, b
         state["num_speakers"] = int(nspk) if str(nspk).isdigit() else None
         print(f"\n=== Dub {url.strip()} → {code} (speakers: {nspk})", flush=True)
         yield ("⏳ Starting…", _tracker_html(FULL_STAGES, {}, "download", elapsed=0),
@@ -957,8 +1005,10 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
         _queued, outputs=[status_md], queue=False, show_progress="hidden",
     ).then(
         _on_process,
-        inputs=[url_input, target_lang, domain, num_speakers_dropdown,
-                voice_name_input, voice_style_dropdown, lang_mix, tts_engine, *cast_voices],
+        inputs=[video_id_state, url_input, clip_start_in, clip_end_in, target_lang, domain,
+                num_speakers_dropdown,
+                voice_name_input, voice_style_dropdown, lang_mix, tts_engine, pipeline_mode,
+                *cast_voices],
         outputs=run_outputs, show_progress="minimal", show_progress_on=[status_md],
     ).then(_after_run, inputs=after_inputs, outputs=after_outputs, show_progress="hidden")
 
@@ -977,14 +1027,14 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
         cast_previews[k].click(_on_preview, inputs=[cast_voices[k], target_lang],
                                outputs=[preview_audio], show_progress="minimal")
 
-    def _on_revoice(segs, vid_id, lang, dom, vname, vstyle, mix, engine, *voices):
+    def _on_revoice(segs, vid_id, lang, dom, vname, vstyle, mix, engine, mode, *voices):
         if not segs:
             yield ("**⚠ Dub a video first.**", gr.update(),
                    *[gr.update()] * (len(run_outputs) - 2))
             return
         state = _cached_state(vid_id, SUPPORTED_LANGS.get(lang, "hi"), dom, vname,
                               BODHAN_STYLES.get(vstyle, "educational lecture"),
-                              _voice_map(*voices), segs, [], mix, engine)
+                              _voice_map(*voices), segs, [], mix, engine, mode)
         if isinstance(state, str):
             yield (f"**{state}**", gr.update(), *[gr.update()] * (len(run_outputs) - 2))
             return
@@ -997,7 +1047,8 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
     ).then(
         _on_revoice,
         inputs=[segments_state, video_id_state, target_lang, domain,
-                voice_name_input, voice_style_dropdown, lang_mix, tts_engine, *cast_voices],
+                voice_name_input, voice_style_dropdown, lang_mix, tts_engine, pipeline_mode,
+                *cast_voices],
         outputs=run_outputs, show_progress="minimal", show_progress_on=[status_md],
     ).then(_after_run, inputs=after_inputs, outputs=after_outputs, show_progress="hidden")
 
@@ -1013,7 +1064,7 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
         outputs=[edit_ops_state, edit_queue_table, parse_status],
         show_progress="minimal", show_progress_on=[parse_status])
 
-    def _on_apply(plan, segs, vid_id, lang, dom, vname, vstyle, mix, engine, *voices):
+    def _on_apply(plan, segs, vid_id, lang, dom, vname, vstyle, mix, engine, mode, *voices):
         none = [gr.update()] * (len(run_outputs) - 2)
         if not plan or not any(r["actions"] for r in plan.get("requests", [])):
             yield ("**⚠ Nothing to apply — use Plan changes first.**", gr.update(), *none)
@@ -1024,7 +1075,7 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
         new_segs, vmap, notes, needs_tr = apply_plan(segs, plan, _voice_map(*voices))
         state = _cached_state(vid_id, SUPPORTED_LANGS.get(lang, "hi"), dom, vname,
                               BODHAN_STYLES.get(vstyle, "educational lecture"),
-                              vmap, new_segs, [], mix, engine)
+                              vmap, new_segs, [], mix, engine, mode)
         if isinstance(state, str):
             yield (f"**{state}**", gr.update(), *none)
             return
@@ -1042,7 +1093,7 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
         _on_apply,
         inputs=[edit_ops_state, segments_state, video_id_state,
                 target_lang, domain, voice_name_input, voice_style_dropdown, lang_mix,
-                tts_engine, *cast_voices],
+                tts_engine, pipeline_mode, *cast_voices],
         outputs=run_outputs, show_progress="minimal", show_progress_on=[status_md],
     ).then(_after_run, inputs=after_inputs, outputs=after_outputs, show_progress="hidden"
     ).then(lambda b, a: ("#### What changed\n" + _diff_md(b, a)) if b and a else "",
@@ -1079,7 +1130,8 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
         _on_find_fix, inputs=[fix_input, segments_state, transcript_table],
         outputs=[transcript_table, fix_status], show_progress="hidden")
 
-    def _on_save_transcript(rows, segs, vid_id, lang, dom, vname, vstyle, mix, engine, *voices):
+    def _on_save_transcript(rows, segs, vid_id, lang, dom, vname, vstyle, mix, engine, mode,
+                            *voices):
         none = [gr.update()] * (len(run_outputs) - 2)
         edits = table_edits(rows, segs or [])
         if not segs:
@@ -1092,7 +1144,7 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
         new_segs, changed = apply_source_edits(segs, edits)
         state = _cached_state(vid_id, SUPPORTED_LANGS.get(lang, "hi"), dom, vname,
                               BODHAN_STYLES.get(vstyle, "educational lecture"),
-                              _voice_map(*voices), new_segs, [], mix, engine)
+                              _voice_map(*voices), new_segs, [], mix, engine, mode)
         if isinstance(state, str):
             yield (f"**{state}**", gr.update(), *none)
             return
@@ -1107,7 +1159,8 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
     ).then(
         _on_save_transcript,
         inputs=[transcript_table, segments_state, video_id_state, target_lang, domain,
-                voice_name_input, voice_style_dropdown, lang_mix, tts_engine, *cast_voices],
+                voice_name_input, voice_style_dropdown, lang_mix, tts_engine, pipeline_mode,
+                *cast_voices],
         outputs=run_outputs, show_progress="minimal", show_progress_on=[status_md],
     ).then(_after_run, inputs=after_inputs, outputs=after_outputs, show_progress="hidden")
 

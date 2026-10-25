@@ -346,6 +346,7 @@ BODHAN_STYLES: dict[str, str] = {
 DEFAULT_STYLE_LABEL = "Auto (match original delivery)"
 DEFAULT_STYLE       = "auto"
 _AUTO_BASE_STYLE    = os.environ.get("AUTO_BASE_STYLE", "educational lecture")
+_PER_LINE_EMOTION   = os.environ.get("PER_LINE_EMOTION", "1") == "1"
 
 
 def _line_style(seg: Segment, global_style: str) -> str:
@@ -354,8 +355,13 @@ def _line_style(seg: Segment, global_style: str) -> str:
         return seg.style_override
     if global_style != "auto":
         return global_style
-    from ..prosody import BODHAN_FOR_DELIVERY
-    return BODHAN_FOR_DELIVERY.get(seg.delivery or "neutral", _AUTO_BASE_STYLE)
+    # One style per speaker for the whole video: switching styles line by line
+    # (calm → audiobook, neutral → lecture) changed the same person's voice
+    # mid-conversation. Only a clearly energetic line gets its own style.
+    if seg.delivery == "energetic" and _PER_LINE_EMOTION:
+        from ..prosody import BODHAN_FOR_DELIVERY
+        return BODHAN_FOR_DELIVERY.get("energetic", _AUTO_BASE_STYLE)
+    return _AUTO_BASE_STYLE
 
 
 def _client() -> OpenAI:
@@ -442,17 +448,35 @@ def _assign_voices(
     # Deal voices out per gender so same-gender speakers get different ones.
     # Whoever talks most gets the target language's own voice — they carry
     # the video, so they should sound the most native.
+    # Each speaker gets the unused voice whose MEASURED pitch is closest to
+    # theirs, so voice adaptation has little or nothing to shift (a large
+    # pitch shift is what sounds processed). The target language's own voices
+    # get a ~1.5 semitone preference so a native voice wins unless a foreign
+    # one is clearly closer. Without pitch data, pool order decides.
+    import math
+    prof = voice_profiles()
+    f0s: dict[int, list[float]] = {}
+    for seg in segments:
+        if seg.f0:
+            f0s.setdefault(seg.speaker if seg.speaker is not None else 0, []).append(seg.f0)
+    spk_f0 = {k: sorted(v)[len(v) // 2] for k, v in f0s.items()}
+    native = {v for v, _, lang in voice_catalogue() if lang == _LANG_ALIAS.get(lang_code, lang_code)}
+
     for gender in ("male", "female"):
         pool = _voice_pool(lang_code, gender, backend)
-        i = 0
         same = [s for s, g in speakers.items() if g == gender and s not in assignment]
         for spk in sorted(same, key=lambda s: -talk[s]):
-            while i < len(pool) and pool[i] in used:
-                i += 1
-            voice = pool[i] if i < len(pool) else pool[-1]
+            free = [v for v in pool if v not in used] or pool
+            target = spk_f0.get(spk)
+
+            def cost(v, k):
+                vf = prof.get(v, {}).get("f0")
+                if not target or not vf:
+                    return k                       # no data: keep pool order
+                return abs(12 * math.log2(vf / target)) + (0 if v in native else 1.5)
+            voice = min(free, key=lambda v: cost(v, free.index(v)))
             used.add(voice)
             assignment[spk] = voice
-            i += 1
     return assignment
 
 
@@ -586,7 +610,9 @@ def synthesize_node(state: PipelineState) -> dict:
     # known, so measure this voice's actual speaking rate, give each
     # overrunning line a precise character budget, rewrite it shorter and
     # re-synthesize once. This is what keeps the dub from sounding rushed.
-    refit_note = _refit_overruns(segments, state.get("audio_path"), _run, lang_code)
+    from .translate import latin_allowed
+    refit_note = _refit_overruns(segments, state.get("audio_path"), _run, lang_code,
+                                 latin_allowed(state))
 
     styles: dict[str, int] = {}
     for s in to_synth:
@@ -615,18 +641,25 @@ def synthesize_node(state: PipelineState) -> dict:
     }
 
 
-_REFIT_ROUNDS = int(os.environ.get("REFIT_ROUNDS", "2"))
+_REFIT_ROUNDS = int(os.environ.get("REFIT_ROUNDS", "3"))
+
+
+_MIN_FILL = float(os.environ.get("MIN_FILL", "0.85"))
 
 
 def _refit_overruns(segments: list[Segment], audio_path: str | None, run,
-                    lang_code: str) -> str:
+                    lang_code: str, latin: bool = False) -> str:
     """
-    Rewrite-and-re-voice any line whose real audio would need more than
-    MAX_STRETCH speed-up, up to _REFIT_ROUNDS times. Shortening the words is
-    what keeps the voice at a natural pace; speeding it up is the last resort.
+    Rewrite-and-re-voice, up to _REFIT_ROUNDS times, any line whose real audio
+      - would need more than MAX_STRETCH speed-up (shortened), or
+      - ends well before the speaker stops talking: under _MIN_FILL of the
+        original line (expanded — restoring dropped meaning first). Without
+        this, short dubs left lips moving over silence.
+    Changing the words keeps the voice at a natural pace; stretching audio is
+    the last resort either way.
     """
     from .align import MAX_STRETCH, slot_seconds, trimmed_duration, _audio_len
-    from .translate import condense_to_budget
+    from .translate import condense_to_budget, expand_to_window
     from .. import tts_rate
 
     ordered = sorted(segments, key=lambda s: s.start)
@@ -659,34 +692,47 @@ def _refit_overruns(segments: list[Segment], audio_path: str | None, run,
         cps_by_voice = {v: sorted(rs)[len(rs) // 2] if len(rs) >= 2 else cps_all
                         for v, rs in rates.items()}
 
-        jobs, over = [], []
+        jobs, over, grow, under = [], [], [], []
         for seg, dur, slot in measured:
+            # Calibrate on THIS clip: Bodhan's rate swings 7–18 chars/s line to
+            # line (punctuation, style, English words), so a global average
+            # mispredicted every rewrite and the rounds oscillated. The line's
+            # own measured rate is the ruler for its new length.
+            n = len(seg.dubbed_text)
             if dur / slot > MAX_STRETCH:
-                cps = cps_by_voice.get(seg.voice or "?", cps_all)
-                # Aim under the cap so the re-voiced clip fits without stretching.
-                budget = int(slot * cps * (0.95 if rnd == 1 else 0.85))
+                budget = int(n * (slot * (0.95 if rnd == 1 else 0.88)) / dur)
                 jobs.append((seg.id, seg.dubbed_text, max(budget, 4)))
                 over.append(seg)
-        if not jobs:
-            notes.append(f"✓ All clips fit their slots at natural pace "
+            elif seg.duration >= 1.2 and dur < _MIN_FILL * seg.duration and dur < slot:
+                grow.append({"id": seg.id, "original": seg.text, "dub": seg.dubbed_text,
+                             "gender": seg.gender or "unknown",
+                             "min_chars": int(n * 0.92 * seg.duration / dur),
+                             "max_chars": int(n * min(slot, 1.03 * seg.duration) / dur)})
+                under.append(seg)
+        if not jobs and not grow:
+            notes.append(f"✓ All clips fill their slots at natural pace "
                          f"(measured {cps_all:.1f} chars/s)")
             break
 
-        new = condense_to_budget(jobs)
-        if not new:
-            why = ("no OPENROUTER_API_KEY" if not os.environ.get("OPENROUTER_API_KEY")
-                   else "already as short as they can naturally be")
-            notes.append(f"⚠ {len(jobs)} clip(s) still too long for their slot ({why}) "
-                         "— they will be sped up")
-            break
+        new = condense_to_budget(jobs) if jobs else {}
+        longer = expand_to_window(grow, lang_code, latin) if grow else {}
         redo = []
         for seg in over:
             if seg.id in new:
                 seg.dubbed_text = new[seg.id]
                 redo.append(seg)
+        for seg in under:
+            if seg.id in longer:
+                seg.dubbed_text = longer[seg.id]
+                redo.append(seg)
+        if not redo:
+            notes.append(f"⚠ {len(jobs)} too-long and {len(grow)} too-short clip(s) could "
+                         "not be rewritten — the fitter will stretch them")
+            break
         run(redo)
-        notes.append(f"✓ Round {rnd}: shortened and re-voiced {len(redo)}/{len(jobs)} "
-                     f"over-long line(s) (measured {cps_all:.1f} chars/s)")
+        notes.append(f"✓ Round {rnd}: re-voiced {sum(s in over for s in redo)} over-long "
+                     f"and {sum(s in under for s in redo)} too-short line(s) "
+                     f"(measured {cps_all:.1f} chars/s)")
     return "\n".join(notes)
 
 
