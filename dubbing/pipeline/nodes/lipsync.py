@@ -148,7 +148,7 @@ def _lipsync_latentsync(
     faces = cache_dir / "faces.npz"
     # Analyses made before head angle was recorded fall back to the strict
     # frontal-only test and skip three-quarter shots: redo them once.
-    if faces.exists() and "yaw" not in np.load(faces).files:
+    if faces.exists() and not {"yaw", "male"} <= set(np.load(faces).files):
         faces.unlink()
     if not faces.exists():
         _run_worker(["--analyze", str(Path(video_path).resolve()), str(faces.resolve())],
@@ -632,6 +632,9 @@ _MIN_SHOT_SECS = float(os.environ.get("MIN_SYNC_SHOT_SECS", "0.4"))
 # talking (static photo / freeze-frame). Measured: still image 0.000,
 # talking faces 0.05-0.08.
 _MIN_MOUTH_MOTION = float(os.environ.get("MIN_MOUTH_MOTION", "0.01"))
+# Per-shot talking face (see _talking_face).
+_LONE_MOUTH = float(os.environ.get("LONE_FACE_MOUTH", "0.012"))
+_TALK_MOUTH = float(os.environ.get("TALK_FACE_MOUTH", "0.02"))
 
 
 def plan_sync_shots(analysis: dict, segments: list[Segment],
@@ -745,5 +748,70 @@ def plan_sync_shots(analysis: dict, segments: list[Segment],
                 cy = float(np.median((b[:, 1] + b[:, 3]) / 2))
                 plan.setdefault(seg.id, []).append((round(float(x), 3), round(float(y), 3), cx, cy))
 
+    # Shots the speaker→face matching missed: sync the face that is clearly
+    # talking in that shot, whoever the diarizer says is speaking. When the
+    # speaker labels are wrong (a trailer: many voices over loud music) the
+    # matching above found 7 s of 98 s; this per-shot pass covers what it
+    # misses without relying on labels. It only ADDS shots.
+    extra = 0.0
+    for seg in segments:
+        if seg.id not in spans:
+            continue
+        a, b = spans[seg.id]
+        have = plan.get(seg.id, [])
+        edges = [a] + [c for c in cuts if a < c < b] + [b]
+        for x, y in zip(edges, edges[1:]):
+            if y - x < _MIN_SHOT_SECS or any(px < y and x < py for px, py, *_ in have):
+                continue
+            pick = _talking_face(t, ident, frontal, mouth, bbox, x, y,
+                                 float(analysis["fps"]), int(analysis["step"]))
+            if not pick:
+                continue
+            face, cx, cy = pick
+            spk = seg.speaker if seg.speaker is not None else 0
+            # A face known to be ANOTHER speaker is the listener reacting
+            # (shot/reverse-shot): never give them this line's words.
+            if face in face_of.values() and face_of.get(spk) != face:
+                continue
+            plan.setdefault(seg.id, []).append((round(float(x), 3), round(float(y), 3), cx, cy))
+            extra += y - x
     note = ", ".join(f"S{s + 1}→face {face_of[s]}" for s in sorted(face_of))
-    return plan, f"faces matched by screen time + lip motion: {note or 'none'}"
+    return plan, (f"faces matched by screen time + lip motion: {note or 'none'}"
+                  + (f"; +{extra:.0f}s from per-shot talking faces" if extra else ""))
+
+
+def _talking_face(t, ident, frontal, mouth, bbox, x, y, fps, step):
+    """
+    (face id, cx, cy) of the face clearly talking in [x, y), or None. A lone dominant
+    face (others under a third of its width) needs only slight mouth motion
+    — a calm talker moves the jaw little (0.019 measured); among comparable
+    faces the talker must move clearly more than the rest.
+    """
+    k = np.where((t >= x) & (t < y) & (ident >= 0) & frontal)[0]
+    n = max(1, int(round((y - x) * fps / step)))
+    cands = []
+    for f in set(ident[k].tolist()):
+        kk = k[ident[k] == f]
+        if len(np.unique(t[kk])) < 0.5 * n:
+            continue
+        mm = mouth[kk]
+        mm = mm[np.isfinite(mm)]
+        if len(mm) < 3:
+            continue
+        w = float(np.median(bbox[kk, 2] - bbox[kk, 0]))
+        cands.append((float(np.median(mm)), w, kk, f))
+    if not cands:
+        return None
+    cands.sort(key=lambda c: -c[1])
+    lone = len(cands) == 1 or cands[1][1] < cands[0][1] / 3
+    if lone:
+        m, _, kk, fid = cands[0]
+        if m < _LONE_MOUTH:
+            return None
+    else:
+        cands.sort(key=lambda c: -c[0])
+        if cands[0][0] < _TALK_MOUTH or cands[1][0] >= 0.7 * cands[0][0]:
+            return None
+        kk, fid = cands[0][2], cands[0][3]
+    bb = bbox[kk]
+    return (fid, float(np.median((bb[:, 0] + bb[:, 2]) / 2)), float(np.median((bb[:, 1] + bb[:, 3]) / 2)))

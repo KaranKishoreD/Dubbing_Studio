@@ -44,7 +44,7 @@ _TINY_SECS = float(os.environ.get("DIARIZE_TINY_SECS", "1.0"))      # always fol
 _MERGE_SIM = float(os.environ.get("DIARIZE_MERGE_SIM", "0.45"))     # fold at any size
 _SMALL_SECS = float(os.environ.get("DIARIZE_SMALL_SECS", "3.0"))
 _MERGE_SIM_SMALL = float(os.environ.get("DIARIZE_MERGE_SIM_SMALL", "0.33"))
-_MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "4"))
+_MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "12"))   # ceiling only; was 4, which capped a 10-character trailer
 
 # A speaker run shorter than this inside a segment is treated as a flicker.
 _MIN_RUN = float(os.environ.get("DIARIZE_MIN_RUN_SECS", "0.6"))
@@ -134,6 +134,15 @@ def diarize_node(state: PipelineState) -> dict:
         asr_note = (f"  text: Bodhan indic-transcribe on {ok} line(s)"
                     + (f", Whisper kept on {bad} that failed" if bad else ""))
 
+    # ── 4c. Faces: split characters the voice diarizer merged ───────────────
+    from .. import face_speakers
+    face_note = ""
+    try:
+        face_note = face_speakers.split_speakers(
+            segments, state.get("video_path"), get_cache_dir(state["video_id"]))
+    except Exception as exc:
+        print(f"  ⚠ speakers from faces skipped: {exc}")
+
     # ── 5. Gender per speaker, delivery per line ─────────────────────────────
     per_spk_f0: dict[int, list[float]] = {}
     line_feats: dict[int, dict] = {}
@@ -168,6 +177,23 @@ def diarize_node(state: PipelineState) -> dict:
             gender_note = "voice classifier"
         except Exception as exc:
             print(f"  ⚠ gender classifier failed, using pitch: {exc}")
+    # Faces decide when they are clear: voice classifiers mistake a man
+    # singing high for a woman (both "female" on a duet, measured).
+    try:
+        fa = face_speakers.analysis(state.get("video_path"), get_cache_dir(state["video_id"]))
+        fg = face_speakers.speaker_genders(segments, fa) if fa else {}
+    except Exception as exc:
+        print(f"  ⚠ face gender skipped: {exc}")
+        fg = {}
+    changed_by_face = []
+    for spk, (g, agree, n) in fg.items():
+        prof = profiles.get(str(spk))
+        if prof and prof.get("gender") != g:
+            changed_by_face.append(f"S{spk}→{g} ({n} lines, {agree:.0%} agree)")
+        if prof:
+            prof["gender"] = g
+    if fg:
+        gender_note += " + faces" + (f" (corrected {', '.join(changed_by_face)})" if changed_by_face else "")
     for seg in segments:
         seg.gender = profiles[str(seg.speaker)]["gender"]
 
@@ -187,7 +213,7 @@ def diarize_node(state: PipelineState) -> dict:
         f"  {len(raw)} ASR segments → split at {split_count} speaker change(s) "
         f"→ {len(segments)} single-speaker lines",
         asr_note,
-    ]
+    ] + ([face_note] if face_note else [])
     notes.append(f"  gender from {gender_note}")
     if relabelled:
         notes.append("  (highest-pitched speaker relabelled female by pitch ratio)")

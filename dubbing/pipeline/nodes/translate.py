@@ -169,6 +169,39 @@ def _bodhan_client() -> OpenAI:
     )
 
 
+def _mark_songs(segments: list[Segment], state) -> str:
+    """Sung lines keep the original audio (song.py); edits can still dub them."""
+    from .. import song
+    vocals = state.get("vocals_path")
+    if not song.ENABLED or not vocals or not os.path.exists(vocals):
+        return ""
+    try:
+        sung = song.sung_lines(segments, vocals, get_cache_dir(state["video_id"]))
+    except Exception as exc:
+        print(f"  ⚠ song detection skipped: {exc}")
+        return ""
+    for s in segments:
+        if s.id in sung and not s.edit_instruction:
+            s.keep_original = True
+    if not sung:
+        return ""
+    note = (f"✓ {len(sung)} line(s) sound sung: "
+            + ", ".join(f"#{i}" for i in sorted(sung)))
+    # Song mode: split sung lyrics from dialogue and plan the target-language
+    # lyric; anything not planned keeps the original singing.
+    from .. import song_mode
+    if (state.get("songs") or "keep") == "keep":
+        return note + " — kept as the original singing (Songs: keep)"
+    if song_mode.available() and not any(s.sung for s in segments):
+        added, plan_note = song_mode.plan(segments, sung, state,
+                                          state["target_lang"].split("-")[0])
+        segments.extend(added)
+        segments.sort(key=lambda s: s.start)
+        if plan_note:
+            note += "\n" + plan_note
+    return note
+
+
 def _openrouter_client() -> OpenAI:
     """
     OpenRouter client with thinking capped on every call. Claude Sonnet 5.5
@@ -217,7 +250,8 @@ def translate_node(state: PipelineState) -> dict:
             seg.edit_instruction = edit_map[seg.id]
             seg.dubbed_text = None
 
-    pending = [s for s in segments if s.dubbed_text is None]
+    song_note = _mark_songs(segments, state)
+    pending = [s for s in segments if s.dubbed_text is None and not s.keep_original]
     if not pending:
         return {"log": state.get("log", []) + ["✓ Translation: all segments cached"]}
 
@@ -273,7 +307,7 @@ def translate_node(state: PipelineState) -> dict:
                  + (f"; {len(failed)} failed there and went to {TRANSLATE_MODEL}" if failed else "")]
         # Bodhan sees one line at a time: no speaker, gender or conversation.
         before = {s.id: s.dubbed_text for s in segments}
-        directed, split = direct_dub(segments, target_lang)
+        directed, split = direct_dub(segments, target_lang, _video_context(state))
         directed_ids = {s.id for s in segments if before.get(s.id) != s.dubbed_text}
         if directed:
             notes.append(f"✓ Dubbing director ({TRANSLATE_MODEL}): {directed} line(s) made "
@@ -300,7 +334,7 @@ def translate_node(state: PipelineState) -> dict:
 
     return {
         "segments": [s.to_dict() for s in segments],
-        "log": state.get("log", []) + notes,
+        "log": state.get("log", []) + ([song_note] if song_note else []) + notes,
     }
 
 
@@ -437,7 +471,7 @@ _OVERRUN_TRIGGER = float(os.environ.get("OVERRUN_TRIGGER", "1.15"))
 # A dub shorter than this share of its time budget leaves the speaker's lips
 # moving in silence (a lecture line: 10.7 s of speech, 6.9 s of dub).
 _MIN_FILL = float(os.environ.get("MIN_FILL", "0.85"))
-_BUDGET_BORROW = float(os.environ.get("BUDGET_BORROW_SECS", "0.6"))
+_BUDGET_BORROW = float(os.environ.get("BUDGET_BORROW_SECS", "0.3"))
 
 
 def time_budgets(ordered: list[Segment], target_lang: str) -> dict[int, tuple[float, int]]:
@@ -448,14 +482,20 @@ def time_budgets(ordered: list[Segment], target_lang: str) -> dict[int, tuple[fl
     """
     from .align import slot_seconds
     from ..tts_rate import chars_per_sec
+    from ..pace import speaker_factors
     cps = chars_per_sec(target_lang.split("-")[0])
+    # A fast talker's line holds more words than a slow lecturer's of the
+    # same length; budgeting both at the voice's average made one rushed
+    # and the other drawn out.
+    tempo = speaker_factors(ordered)
     out = {}
     for i, s in enumerate(ordered):
         # Borrowing silence is a safety margin for the fitter, not part of the
         # target: a line written to fill 3 s of borrowed pause keeps talking
         # long after the speaker's mouth has stopped.
         secs = min(slot_seconds(ordered, i, None), s.duration + _BUDGET_BORROW)
-        out[s.id] = (round(secs, 2), max(4, int(secs * cps * 0.95)))
+        f = tempo.get(s.speaker if s.speaker is not None else 0, 1.0)
+        out[s.id] = (round(secs, 2), max(4, int(secs * cps * f * 0.95)))
     return out
 
 _COMPRESS_SYSTEM = """\
@@ -495,7 +535,7 @@ def _compress_overlong(segments: list[Segment], target_lang: str,
     budgets = time_budgets(sorted(segments, key=lambda s: s.start), target_lang)
     jobs: list[tuple[Segment, int]] = []
     for seg in segments:
-        if not seg.dubbed_text or seg.id in (skip or ()):
+        if not seg.dubbed_text or seg.id in (skip or ()) or seg.keep_original:
             continue
         budget = budgets[seg.id][1]
         if budget > 0 and len(seg.dubbed_text) > budget * _OVERRUN_TRIGGER:
@@ -591,6 +631,12 @@ Rules:
    names as they are. If the budget is tight, cut filler words and
    repetition — never a clause; a little over budget beats lost meaning.
 6. Same id, one output per input line, in {lang} script.
+9. TRANSCREATE, DON'T TRANSLATE. Jokes, sarcasm, slang, punch lines and
+   catchphrases must land in {lang} the way they land in the original:
+   use the {lang} idiom, slang or comic phrasing a native writer would
+   choose for the same effect and timing, never a word-for-word rendering
+   that leaves the joke flat or literal. Use the video title (genre: film
+   trailer, comedy, lecture…) to judge the tone.
 8. SPEAKABLE. A voice reads the dub aloud. Write formulas, symbols,
    variables, powers, sets, units and abbreviations the way the speaker
    would SAY them in {lang} (as words), never as notation a voice cannot
@@ -610,7 +656,16 @@ Return ONLY JSON:
 """
 
 
-def direct_dub(segments: list[Segment], target_lang: str) -> int:
+def _video_context(state) -> str:
+    """Title and channel of the video, so the director knows the genre."""
+    try:
+        meta = json.loads((get_cache_dir(state["video_id"]) / "meta.json").read_text(encoding="utf-8"))
+        return " — ".join(x for x in (meta.get("title"), meta.get("channel")) if x)
+    except Exception:
+        return ""
+
+
+def direct_dub(segments: list[Segment], target_lang: str, context: str = "") -> int:
     """
     One batched pass over the whole dialogue: gender agreement, colloquial
     register, consistent address, and length within each line's time
@@ -633,7 +688,9 @@ def direct_dub(segments: list[Segment], target_lang: str) -> int:
         resp = _openrouter_client().chat.completions.create(
             model=TRANSLATE_MODEL,
             messages=[{"role": "system", "content": _DIRECTOR_SYSTEM.format(lang=lang)},
-                      {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                      {"role": "user", "content": json.dumps(
+                          {"video": context, "lines": payload} if context else payload,
+                          ensure_ascii=False)}],
             temperature=0.2)
         items = _parse_items(resp.choices[0].message.content.strip())
     except Exception as exc:

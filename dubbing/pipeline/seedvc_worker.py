@@ -28,7 +28,10 @@ def main(jobs_path: str, results_path: str) -> None:
     import inference as sv
 
     args = sv.argparse.Namespace(
-        checkpoint=None, config=None, fp16=torch.cuda.is_available(), f0_condition=False, auto_f0_adjust=False,
+        checkpoint=None, config=None, fp16=torch.cuda.is_available(),
+        # SEEDVC_SINGING=1: the f0-conditioned 44 kHz singing model, which keeps
+        # the source melody exactly (song mode); else the speech model.
+        f0_condition=os.environ.get("SEEDVC_SINGING") == "1", auto_f0_adjust=False,
         semi_tone_shift=0, length_adjust=1.0,
         diffusion_steps=int(os.environ.get("SEEDVC_STEPS", "30")),
         inference_cfg_rate=float(os.environ.get("SEEDVC_CFG", "0.7")),

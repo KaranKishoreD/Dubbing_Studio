@@ -108,7 +108,7 @@ REVOICE_STAGES = FULL_STAGES[6:]
 # ── Voice casting ─────────────────────────────────────────────────────────────
 # One row per detected speaker. Six covers interviews and panels; more than
 # that and diarization itself is the weak link, not the UI.
-MAX_CAST_ROWS = 6
+MAX_CAST_ROWS = 12
 AUTO_VOICE = "Auto"
 _CATALOGUE = voice_catalogue()                     # 23 female + 22 male
 _PROFILES = voice_profiles()                       # measured pitch per voice
@@ -151,8 +151,9 @@ _PREVIEW_TEXT = {
 
 def _base_state(video_id, target_lang, domain, voice_name, voice_style, voice_map,
                 lang_mix: str = "standard", tts_backend: str = "bodhan",
-                translator: str = "indic") -> PipelineState:
+                translator: str = "indic", songs: str = "keep") -> PipelineState:
     return {
+        "songs": songs,
         "lang_mix": lang_mix,
         "tts_backend": tts_backend,
         "translator": translator,
@@ -787,7 +788,7 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
                 target_lang = gr.Dropdown(choices=list(SUPPORTED_LANGS.keys()),
                                           value="Hindi (हिन्दी)", label="Dub into")
                 num_speakers_dropdown = gr.Dropdown(
-                    choices=["Auto", "1", "2", "3", "4", "5", "6"], value="Auto",
+                    choices=["Auto"] + [str(n) for n in range(1, 13)], value="Auto",
                     label="Speakers", info="Set it if you know — most reliable")
             lang_mix = gr.Radio(
                 choices=[("Standard (as before)", "standard"), ("Pure", "pure"),
@@ -799,6 +800,11 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
                 choices=[("LLM translation (context-aware)", "llm"),
                          ("Indic: Bodhan translation, LLM only for lines it fails", "indic")],
                 value="indic", label="Pipeline")
+            songs_mode = gr.Radio(
+                choices=[("Keep the original singing", "keep"),
+                         ("Re-sing in the dub language (experimental)", "resing")],
+                value="keep", label="Songs",
+                info="Re-singing composes a new tune (~$0.04 per phrase); the original melody is not kept yet")
             tts_engine = gr.Radio(
                 choices=[("Bodhan Indic-Speak", "bodhan"), ("Sarvam Bulbul v3", "sarvam")],
                 value="bodhan", label="Voice engine",
@@ -978,7 +984,7 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
                 segs, st.get("video_id"), lang, *_cast_updates(segs))
 
     def _on_process(cur_vid, url, c_start, c_end, lang, dom, nspk, vname, vstyle, mix, engine,
-                    mode, *voices):
+                    mode, songs, *voices):
         if not url.strip():
             yield ("**⚠ Paste a YouTube link first.**", _idle_tracker(),
                    *[gr.update()] * (len(run_outputs) - 2))
@@ -1000,7 +1006,7 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
         vmap = _voice_map(*voices) if vid == cur_vid else {}
         state = _base_state(vid, code, dom, vname,
                             BODHAN_STYLES.get(vstyle, "educational lecture"), vmap,
-                            mix, engine, mode)
+                            mix, engine, mode, songs)
         state["url"] = url.strip()
         state["clip_start"], state["clip_end"] = a, b
         state["num_speakers"] = int(nspk) if str(nspk).isdigit() else None
@@ -1029,6 +1035,7 @@ with gr.Blocks(title="Raga Dubbing Studio") as demo:
         inputs=[video_id_state, url_input, clip_start_in, clip_end_in, target_lang, domain,
                 num_speakers_dropdown,
                 voice_name_input, voice_style_dropdown, lang_mix, tts_engine, pipeline_mode,
+                songs_mode,
                 *cast_voices],
         outputs=run_outputs, show_progress="minimal", show_progress_on=[status_md],
     ).then(_after_run, inputs=after_inputs, outputs=after_outputs, show_progress="hidden")

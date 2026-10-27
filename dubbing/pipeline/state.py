@@ -43,6 +43,11 @@ class Segment:
     # "low" = refine step is unsure. asr_raw = the text before refinement.
     asr_flag: Optional[str] = None
     asr_raw: Optional[str] = None
+    # Song mode: this piece is sung lyrics (dubbed_text holds the sung
+    # lyric, re-sung in assemble) and how the original is sung.
+    sung: bool = False
+    song_style: Optional[str] = None
+    song_gender: Optional[str] = None
 
     _FIELDS = {
         "id", "start", "end", "text", "lang", "words",
@@ -50,6 +55,7 @@ class Segment:
         "lip_synced_clip", "original_clip", "edit_instruction", "edit_hash",
         "speaker", "gender", "f0", "voice", "delivery", "pace", "asr_alt",
         "sync_clips", "keep_original", "style_override", "asr_flag", "asr_raw",
+        "sung", "song_style", "song_gender",
     }
 
     @property
@@ -106,6 +112,9 @@ class PipelineState(TypedDict):
     # "indic": Bodhan translates every line, the LLM only the lines it fails;
     # "llm": the LLM translates the whole dialogue.
     translator: Optional[str]
+    # Sung lyrics: "resing" (song mode, re-sung in the dub language) or
+    # "keep" (left as the original singing).
+    songs: Optional[str]
     # Optional part of the video to dub, in seconds of the source video.
     # Only this range is downloaded and processed.
     clip_start: Optional[float]

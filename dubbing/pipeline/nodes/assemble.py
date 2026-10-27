@@ -107,7 +107,7 @@ def _assemble_audio_overlay(
     # trimmed speech, not ambience.
     pad = int(_DUCK_PAD * sr)
     spans: list[tuple[int, int]] = []
-    dubs: list[tuple[int, np.ndarray]] = []
+    dubs: list[tuple[int, np.ndarray, Segment]] = []
     for seg in segments:
         if not seg.aligned_audio or not Path(seg.aligned_audio).exists():
             continue
@@ -117,7 +117,14 @@ def _assemble_audio_overlay(
         if a >= b:
             continue
         spans.append((max(0, a - pad), min(total, b + pad)))
-        dubs.append((a, y))
+        dubs.append((a, y, seg))
+
+    # Song mode: sung lyrics re-sung in the target language (song_mode.py).
+    # Their span joins the dialogue mask (original voice → score) and the new
+    # vocal goes in at the original singer's level.
+    sung_parts = _render_songs(segments, state, cache_dir, sr, total) if bed is not None else []
+    for a, y in sung_parts:
+        spans.append((max(0, a - int(0.03 * sr)), min(total, a + len(y) + int(0.03 * sr))))
 
     merged: list[list[int]] = []
     for s, e in sorted(spans):
@@ -146,7 +153,11 @@ def _assemble_audio_overlay(
         mix = base * (1.0 - m * (1.0 - g))
         how = f"ducked {_DUCK_DB:.0f} dB (no background bed available)"
 
-    for a, y in dubs:
+    balanced = _balance_dialogue(mix, dubs, state, sr)
+    for a, y, _seg in dubs:
+        n = min(len(y), total - a)
+        mix[a:a + n] += y[:n, None]
+    for a, y in sung_parts:
         n = min(len(y), total - a)
         mix[a:a + n] += y[:n, None]
 
@@ -193,6 +204,10 @@ def _assemble_audio_overlay(
         f"voice {how} across {ducked_s:.1f}s ({len(merged)} span(s)), "
         f"{total/sr - ducked_s:.1f}s of original audio untouched"
     )
+    if balanced:
+        note += f"; {balanced} line(s) lifted over a loud score (dialogue kept clear)"
+    if sung_parts:
+        note += f"; {len(sung_parts)} sung phrase(s) re-sung in the target language"
     if _LOUDNORM:
         note += f"; normalized to {_LUFS_TARGET} LUFS"
     note += lip_note
@@ -202,6 +217,89 @@ def _assemble_audio_overlay(
         "final_audio": str(final_audio),
         "log": state.get("log", []) + [note],
     }
+
+
+def _render_songs(segments: list[Segment], state: PipelineState, cache_dir: Path,
+                  sr: int, total: int) -> list:
+    """[(start sample, mono vocal)] for every sung piece song mode could render."""
+    import numpy as np
+    from .. import song_mode
+    sung = [s for s in segments if s.sung and s.keep_original and s.dubbed_text]
+    if not sung or not song_mode.available() or not state.get("vocals_path"):
+        return []
+    voc = _read_mono(state["vocals_path"], target_sr=sr)
+    out = []
+    for seg in sung:
+        y = song_mode.render(seg, state, cache_dir, state["target_lang"].split("-")[0], sr)
+        if y is None or not len(y):
+            continue
+        a = int(seg.start * sr)
+        ref = voc[a:a + len(y)]
+        g = np.sqrt(np.mean(ref ** 2) + 1e-12) / (np.sqrt(np.mean(y ** 2)) + 1e-9)
+        out.append((a, (y * min(g, 8.0)).astype(np.float32)))
+    return out
+
+
+def _balance_dialogue(mix, dubs: list, state: PipelineState, sr: int) -> int:
+    """
+    Keep every dubbed line as clear over the background as the original
+    voice was (and at least _MIN_MARGIN dB clear). A dub laid at its own
+    level was buried under a trailer's score in action scenes. Where a line
+    falls short, the dub is raised (≤ _MAX_LIFT dB) and the background is
+    dipped just around it (≤ _MAX_DUCK dB, 100 ms ramps). Lines already clear
+    — speech over quiet rooms — are untouched. Edits `dubs` gains in place,
+    `mix` (background) in place; returns lines changed.
+    """
+    import numpy as np
+    vocals_path = state.get("vocals_path")
+    if not vocals_path or not Path(vocals_path).exists() or not dubs:
+        return 0
+    voc = _read_mono(vocals_path, target_sr=sr)
+    bg = mix.mean(axis=1)
+    hop = int(0.05 * sr)
+
+    def frames_db(x):
+        n = len(x) // hop
+        if n < 3:
+            return None
+        r = np.sqrt((x[:n * hop].reshape(n, hop) ** 2).mean(1)) + 1e-9
+        return 20 * np.log10(r)
+
+    duck = np.zeros(len(mix), dtype=np.float32)        # dB of dip wanted
+    changed = 0
+    for k, (a, y, seg) in enumerate(dubs):
+        b = min(len(mix), a + len(y))
+        ov = frames_db(voc[int(seg.start * sr):int(seg.end * sr)])
+        ob = frames_db(bg[int(seg.start * sr):int(seg.end * sr)])
+        dv, db = frames_db(y[:b - a]), frames_db(bg[a:b])
+        if ov is None or ob is None or dv is None or db is None:
+            continue
+        orig_margin = np.percentile(ov, 90) - np.median(ob)
+        dub_margin = np.percentile(dv, 90) - np.median(db)
+        short = max(orig_margin + 1.0, _MIN_MARGIN) - dub_margin
+        if short <= 0.5:
+            continue
+        lift = min(short, _MAX_LIFT)
+        y *= 10 ** (lift / 20)
+        dip = min(short - lift, _MAX_DUCK)
+        if dip > 0.5:
+            p = int(0.15 * sr)
+            duck[max(0, a - p):min(len(mix), b + p)] = np.maximum(
+                duck[max(0, a - p):min(len(mix), b + p)], dip)
+        changed += 1
+        dubs[k] = (a, y, seg)
+    if duck.any():
+        ramp = int(0.1 * sr)
+        kernel = np.ones(ramp, dtype=np.float32) / ramp
+        duck = np.convolve(duck, kernel, mode="same")
+        mix *= (10 ** (-duck / 20))[:, None]
+    return changed
+
+
+# Dialogue over the background (see _balance_dialogue).
+_MIN_MARGIN = float(os.environ.get("DIALOGUE_MIN_MARGIN_DB", "8"))
+_MAX_LIFT = float(os.environ.get("DIALOGUE_MAX_LIFT_DB", "6"))
+_MAX_DUCK = float(os.environ.get("BED_MAX_DUCK_DB", "8"))
 
 
 # How many lip-synced clips go into one ffmpeg overlay pass.

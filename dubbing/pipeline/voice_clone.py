@@ -129,6 +129,72 @@ def _clean_chunks(y: np.ndarray, sr: int, target: float | None) -> list[np.ndarr
     return out
 
 
+_SAME_VOICE = float(os.environ.get("VC_SAME_VOICE_SIM", "0.6"))
+
+
+def line_references(segments, vocals_path: str, cache_dir: Path) -> dict[int, str]:
+    """
+    {segment id: reference wav} built from voices that SOUND like that line.
+
+    The speaker label can be wrong — over a loud film score pyannote merged
+    several characters into one speaker and split one actor across several,
+    so cloning against "the speaker's" reference gave a face the wrong voice,
+    and one actor different voices. Here each line's own voice is
+    fingerprinted (ECAPA), and its reference is that line plus the other
+    lines that sound like the same person, keeping only clean stretches at
+    that voice's pitch. With correct diarization this equals the speaker's
+    own lines, as before.
+    """
+    import librosa
+    import torch
+    from speechbrain.inference.speaker import EncoderClassifier
+    voc, sr = sf.read(vocals_path, dtype="float32", always_2d=True)
+    voc = voc.mean(axis=1)
+    ordered = sorted(segments, key=lambda s: s.start)
+    usable = [s for s in ordered if s.duration >= 0.8 and not any(
+        o is not s and o.start < s.end and s.start < o.end for o in ordered)]
+    if len(usable) < 2:
+        return {}
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    enc = EncoderClassifier.from_hparams("speechbrain/spkrec-ecapa-voxceleb",
+                                         run_opts={"device": dev})
+    embs = {}
+    with torch.no_grad():
+        for s in usable:
+            y = voc[int(s.start * sr):int(s.end * sr)]
+            y16 = librosa.resample(y, orig_sr=sr, target_sr=16000) if sr != 16000 else y
+            e = enc.encode_batch(torch.tensor(y16)[None].to(dev)).squeeze()
+            embs[s.id] = torch.nn.functional.normalize(e, dim=0).cpu().numpy()
+    ids = list(embs)
+    M = np.stack([embs[i] for i in ids])
+    sim = M @ M.T
+    by_id = {s.id: s for s in usable}
+    gap = np.zeros(int(0.15 * sr), np.float32)
+    out = {}
+    for k, sid in enumerate(ids):
+        order = [ids[j] for j in np.argsort(-sim[k]) if sim[k, j] >= _SAME_VOICE or ids[j] == sid]
+        order = [sid] + [i for i in order if i != sid]
+        own = by_id[sid]
+        target = _median_f0(voc[int(own.start * sr):int(own.end * sr)], sr)
+        key = hashlib.sha1(repr([(round(by_id[i].start, 2), round(by_id[i].end, 2)) for i in order[:12]]
+                                + [_REF_VERSION, round(target or 0)]).encode()).hexdigest()[:10]
+        path = cache_dir / f"vc_ref_l{sid}_{key}.wav"
+        if not path.exists():
+            parts, kept = [], 0.0
+            for i in order:
+                seg = by_id[i]
+                for c in _clean_chunks(voc[int(seg.start * sr):int(seg.end * sr)], sr, target):
+                    parts += [c, gap]
+                    kept += len(c) / sr
+                if kept >= _REF_SECS:
+                    break
+            if kept < 1.0:                 # too little clean voice: use the speaker's
+                continue
+            sf.write(str(path), np.concatenate(parts)[:int(_REF_SECS * sr)], sr)
+        out[sid] = str(path)
+    return out
+
+
 def clone_lines(segments, vocals_path: str, cache_dir: Path, segs_dir: Path) -> tuple[dict, str]:
     """
     {segment id: cloned wav} for every dubbed line that converted well, plus a
@@ -136,9 +202,14 @@ def clone_lines(segments, vocals_path: str, cache_dir: Path, segs_dir: Path) -> 
     reused from the cache.
     """
     refs = references(segments, vocals_path, cache_dir)
+    try:
+        by_line = line_references(segments, vocals_path, cache_dir)
+    except Exception as exc:
+        print(f"  ⚠ per-line voice references skipped ({exc}) — speaker references used")
+        by_line = {}
     done, jobs = {}, []
     for s in segments:
-        ref = refs.get(s.speaker or 0)
+        ref = by_line.get(s.id) or refs.get(s.speaker or 0)
         if not s.dubbed_audio or not ref or not os.path.exists(s.dubbed_audio):
             continue
         stem = os.path.splitext(os.path.basename(s.dubbed_audio))[0]
@@ -258,17 +329,18 @@ def _env_corr(a: np.ndarray, b: np.ndarray, sr: int) -> float:
     return float(np.corrcoef(ea, eb)[0, 1])
 
 
-def _run(jobs: list[dict], cache_dir: Path) -> dict[str, str]:
+def _run(jobs: list[dict], cache_dir: Path, extra_env: dict | None = None,
+         tag: str = "seedvc") -> dict[str, str]:
     from .nodes.lipsync import _free_gpu_gb
-    jobs_path = cache_dir / "seedvc_jobs.json"
-    results_path = cache_dir / "seedvc_results.json"
+    jobs_path = cache_dir / f"{tag}_jobs.json"
+    results_path = cache_dir / f"{tag}_results.json"
     jobs_path.write_text(json.dumps(jobs), encoding="utf-8")
     results_path.unlink(missing_ok=True)
-    env = dict(os.environ)
+    env = dict(os.environ, **(extra_env or {}))
     if _free_gpu_gb() < _GPU_NEED_GB:
         env["CUDA_VISIBLE_DEVICES"] = ""          # shared GPU is full: CPU, slower
         print(f"  ⚠ voice cloning on CPU — under {_GPU_NEED_GB:g} GB GPU free")
-    with open(cache_dir / "seedvc.log", "w") as log:
+    with open(cache_dir / f"{tag}.log", "w") as log:
         subprocess.run([str(_PY), str(_WORKER), str(jobs_path.resolve()),
                         str(results_path.resolve())],
                        cwd=str(_DIR), env=env, stdout=log, stderr=subprocess.STDOUT)

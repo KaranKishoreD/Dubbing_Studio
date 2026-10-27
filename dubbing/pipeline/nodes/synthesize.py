@@ -219,14 +219,23 @@ DEFAULT_STYLE       = "auto"
 _AUTO_BASE_STYLE    = os.environ.get("AUTO_BASE_STYLE", "educational lecture")
 
 
+# Auto mode: the base style of each speaker, picked from their tempo
+# (pace.py) at the start of synthesize_node.
+_SPEAKER_STYLE: dict[int, str] = {}
+
+
 def _line_style(seg: Segment, global_style: str) -> str:
-    """Global style, or in auto mode the style matching this line's delivery."""
+    """
+    Global style, or in auto mode the speaker's own style (matched to their
+    tempo). Only clearly energetic lines get a style of their own: switching
+    styles line by line made one person's voice change mid-conversation.
+    """
     if seg.style_override:             # set by an edit ("make line 5 sad")
         return seg.style_override
     if global_style != "auto":
         return global_style
-    from ..prosody import BODHAN_FOR_DELIVERY
-    return BODHAN_FOR_DELIVERY.get(seg.delivery or "neutral", _AUTO_BASE_STYLE)
+    base = _SPEAKER_STYLE.get(seg.speaker if seg.speaker is not None else 0, _AUTO_BASE_STYLE)
+    return "happy" if seg.delivery == "energetic" else base
 
 
 def _client() -> OpenAI:
@@ -412,6 +421,7 @@ def synthesize_node(state: PipelineState) -> dict:
         seg.voice = voice_by_speaker.get(
             seg.speaker if seg.speaker is not None else 0
         )
+    pace_note = _pick_speaker_styles(segments, lang_code, global_voice_style)
 
     # Lines with English kept in English spelling (Sarvam translation) that a
     # Bodhan voice will read: Bodhan mangles Latin, so it gets a native-script
@@ -493,7 +503,7 @@ def synthesize_node(state: PipelineState) -> dict:
     for s in to_synth:
         st = _resolve_style(s.edit_instruction, _line_style(s, global_voice_style))
         styles[st] = styles.get(st, 0) + 1
-    notes = [
+    notes = ([pace_note] if pace_note else []) + [
         f"✓ Synthesized {processed} segments (lang: {lang_code}) — cast: "
         + _cast_summary(segments)
         + " — styles: " + ", ".join(f"{k}×{v}" for k, v in sorted(styles.items()))
@@ -616,6 +626,31 @@ def _refit_overruns(segments: list[Segment], audio_path: str | None, run,
                      f"{sum(s in under for s in redo)} too-short line(s) "
                      f"(measured {cps_all:.1f} chars/s)")
     return "\n".join(notes)
+
+
+def _pick_speaker_styles(segments: list[Segment], lang_code: str, global_style: str) -> str:
+    """Auto mode: each speaker's style = the one closest to their tempo."""
+    from .. import pace
+    _SPEAKER_STYLE.clear()
+    if global_style != "auto":
+        return ""
+    factors = pace.speaker_factors(segments)
+    picked = []
+    for spk, factor in sorted(factors.items()):
+        mine = [s for s in segments if (s.speaker or 0) == spk and s.dubbed_text and s.voice]
+        if not mine or is_sarvam(mine[0].voice) or str(mine[0].voice).startswith("gptaudio:"):
+            continue
+        sample = max((s.dubbed_text for s in mine), key=len)[:160]
+        try:
+            rates = pace.measure_styles(mine[0].voice, lang_code, _speakable(sample),
+                                        lambda t, l, v, st: tts_bytes(t, l, v, st))
+        except Exception as exc:
+            print(f"  ⚠ style speeds not measured: {exc}")
+            rates = {}
+        style = pace.pick_style(factor, rates, _AUTO_BASE_STYLE)
+        _SPEAKER_STYLE[spk] = style
+        picked.append(f"S{spk + 1} {factor:.2f}× → {style}")
+    return ("✓ Pace: " + ", ".join(picked)) if picked else ""
 
 
 def _speakable(text: str) -> str:

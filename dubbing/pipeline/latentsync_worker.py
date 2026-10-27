@@ -55,6 +55,7 @@ def main(jobs_path: str, results_path: str) -> None:
         scheduler=DDIMScheduler.from_pretrained("configs"),
     ).to("cuda")
     target = _target_face_patch()
+    _tolerant_faces()
     tmp_root = _private_temp_dirs()
     if os.environ.get("LATENTSYNC_DEEPCACHE", "1") == "1":
         from DeepCache import DeepCacheSDHelper
@@ -87,6 +88,53 @@ def main(jobs_path: str, results_path: str) -> None:
             json.dump(results, f)
     import shutil
     shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _tolerant_faces(max_missing: float = 0.4) -> None:
+    """
+    LatentSync drops a whole shot when the face is missed in a single frame
+    (motion blur, a hand, a quick turn): 14 of 20 trailer shots failed that
+    way. A frame without a detected face reuses the alignment of the nearest
+    frame that has one (the face is tracked through the gap); only a shot
+    missing the face in more than `max_missing` of its frames is dropped.
+    """
+    import cv2
+    import kornia
+    import numpy as np
+    import torch
+    from einops import rearrange
+    import latentsync.pipelines.lipsync_pipeline as lp
+
+    def affine_transform_video(self, video_frames):
+        ip = self.image_processor
+        rs = ip.restorer
+        res = [None] * len(video_frames)
+        for i, frame in enumerate(video_frames):
+            try:
+                res[i] = ip.affine_transform(frame)
+            except RuntimeError:
+                pass
+        good = [i for i, r in enumerate(res) if r is not None]
+        if not good or 1 - len(good) / len(video_frames) > max_missing:
+            raise RuntimeError("Face not detected")
+        for i, r in enumerate(res):
+            if r is not None:
+                continue
+            _, box, m = res[min(good, key=lambda g: abs(g - i))]
+            img = rearrange(torch.from_numpy(video_frames[i]).to(device=rs.device, dtype=rs.dtype),
+                            "h w c -> c h w").unsqueeze(0)
+            face = kornia.geometry.transform.warp_affine(
+                img, m, (rs.face_size[1], rs.face_size[0]), mode="bilinear",
+                padding_mode="fill", fill_value=rs.fill_value)
+            face = rearrange(face.squeeze(0), "c h w -> h w c").cpu().numpy().astype(np.uint8)
+            face = cv2.resize(face, (ip.resolution, ip.resolution), interpolation=cv2.INTER_LANCZOS4)
+            res[i] = (rearrange(torch.from_numpy(face), "h w c -> c h w"), box, m)
+        if len(good) < len(video_frames):
+            print(f"[latentsync] face tracked through {len(video_frames) - len(good)} "
+                  f"of {len(video_frames)} frames", flush=True)
+        return torch.stack([r[0] for r in res]), [r[1] for r in res], [r[2] for r in res]
+
+    lp.LipsyncPipeline.affine_transform_video = affine_transform_video
 
 
 def _private_temp_dirs() -> str:
@@ -172,13 +220,14 @@ def analyze(video_path: str, out_path: str) -> None:
     cuts = [s[0].get_seconds() for s in detect(video_path, ContentDetector())][1:]
 
     app = FaceAnalysis(name="buffalo_l", root="checkpoints/auxiliary",
-                       allowed_modules=["detection", "recognition"],
+                       allowed_modules=["detection", "recognition", "genderage"],
                        providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
     app.prepare(ctx_id=0, det_size=(640, 640))
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    rows = {"t": [], "bbox": [], "score": [], "frontal": [], "yaw": [], "mouth": [], "emb": []}
+    rows = {"t": [], "bbox": [], "score": [], "frontal": [], "yaw": [], "mouth": [], "emb": [],
+            "male": []}
     prev_mouths: list[tuple[np.ndarray, np.ndarray]] = []   # (emb, mouth crop) last sample
     i = 0
     while True:
@@ -220,6 +269,10 @@ def analyze(video_path: str, out_path: str) -> None:
             rows["yaw"].append(float(yaw))
             rows["mouth"].append(motion)
             rows["emb"].append(emb)
+            # Face gender: reliable for singers, where voice-based gender
+            # classifiers hear a man singing at 260 Hz as a woman.
+            rows["male"].append(1.0 if getattr(f, "sex", None) == "M" else
+                                0.0 if getattr(f, "sex", None) == "F" else np.nan)
         prev_mouths = cur_mouths
         i += 1
     cap.release()
@@ -230,6 +283,7 @@ def analyze(video_path: str, out_path: str) -> None:
         yaw=np.array(rows["yaw"], np.float32),
         mouth=np.array(rows["mouth"], np.float32),
         emb=np.array(rows["emb"], np.float32).reshape(-1, 512),
+        male=np.array(rows["male"], np.float32),
         cuts=np.array(cuts, np.float32), fps=np.float32(fps), step=np.int32(step))
     print(f"[analyze] {len(rows['t'])} faces in {i} frames, {len(cuts)} cuts", flush=True)
 

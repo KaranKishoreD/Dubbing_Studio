@@ -38,10 +38,17 @@ MAX_STRETCH = float(os.environ.get("MAX_STRETCH", "1.10"))
 HARD_MAX_STRETCH = float(os.environ.get("HARD_MAX_STRETCH", "1.25"))
 MIN_RATE = float(os.environ.get("MIN_RATE", "0.90"))
 GAP_GUARD = float(os.environ.get("GAP_GUARD_SECS", "0.08"))
-GAP_BORROW_MAX = float(os.environ.get("GAP_BORROW_MAX_SECS", "3.0"))
+# How far a dub may run past the end of the speaker's line into silence.
+# 3 s let a dub keep talking long after the mouth closed or into the next
+# shot (fast-cut trailers); a short overhang is all speech needs.
+GAP_BORROW_MAX = float(os.environ.get("GAP_BORROW_MAX_SECS", "1.0"))
 _UNDERRUN = 0.95
 _FADE_MS = 80
 _EDGE_FADE_MS = 15
+# Speed smoothing between close lines of one speaker (see _smooth_rates).
+_MAX_JUMP = float(os.environ.get("MAX_SPEED_JUMP", "0.15"))
+_SMOOTH_GAP = float(os.environ.get("SMOOTH_GAP_SECS", "1.0"))
+_SMOOTH_MIN_FILL = 0.85
 _TRIM_TOP_DB = 40
 
 
@@ -73,32 +80,30 @@ def align_node(state: PipelineState) -> dict:
     # Each TTS line re-voiced in its original speaker's voice (same length).
     cloned, clone_note = _clone_voices(segments, state, segs_dir)
 
+    plan = []                      # [seg, y, sr, rate, need, out]
     for i, seg in enumerate(segments):
         if not seg.dubbed_audio:
             continue
         source = cloned.get(seg.id, seg.dubbed_audio)
-        stem = os.path.splitext(os.path.basename(source))[0]
-        out = segs_dir / f"{stem}_fit2_{MAX_STRETCH}_{HARD_MAX_STRETCH}_{MIN_RATE}.wav"
-
         y, sr = _load_trimmed(source)
         dur = len(y) / sr
         slot = slot_seconds(segments, i, total)
         need = dur / slot if slot > 0 else 1.0
         worst = max(worst, need)
-
         if need <= 1.0:
-            if dur < _UNDERRUN * seg.duration:
-                rate = max(dur / seg.duration, MIN_RATE)
-                status = "slowed" if rate < 0.995 else "fits"
-            else:
-                rate, status = 1.0, "fits"
+            rate = max(dur / seg.duration, MIN_RATE) if dur < _UNDERRUN * seg.duration else 1.0
         else:
             # Never cut words off: a line still too long after rewriting is
             # sped up exactly as much as it needs, even past HARD_MAX_STRETCH.
             # Trimming had dropped phrase endings mid-sentence.
             rate = need
-            status = "sped"
+        plan.append([seg, y, sr, rate, need, source])
 
+    smoothed = _smooth_rates(plan)
+
+    for seg, y, sr, rate, need, source in plan:
+        stem = os.path.splitext(os.path.basename(source))[0]
+        out = segs_dir / f"{stem}_fit3_{rate:.3f}.wav"
         if not out.exists():
             y2 = _stretch(y, sr, rate) if abs(rate - 1.0) > 0.005 else y
             # Short fades so no line starts or stops with a click.
@@ -108,10 +113,11 @@ def align_node(state: PipelineState) -> dict:
                 y2[:f] *= np.linspace(0.0, 1.0, f, dtype=np.float32)
                 y2[-f:] *= np.linspace(1.0, 0.0, f, dtype=np.float32)
             sf.write(str(out), y2, sr)
-
         if need > HARD_MAX_STRETCH:
             status = "trimmed"          # counted as "over the limit", nothing is cut
             print(f"  ⚠ line {seg.id}: needs {need:.2f}× to fit — sped up, no words cut")
+        else:
+            status = "sped" if rate > 1.005 else "slowed" if rate < 0.995 else "fits"
         counts[status] += 1
         seg.aligned_audio = str(out)
 
@@ -119,11 +125,43 @@ def align_node(state: PipelineState) -> dict:
         f"✓ Fitted {sum(counts.values())} clips — {counts['fits']} as-is, "
         f"{counts['slowed']} slowed, {counts['sped']} sped up (≤{HARD_MAX_STRETCH}×), "
         f"{counts['trimmed']} over {HARD_MAX_STRETCH}× (sped up, not cut); worst need {worst:.2f}×"
+        + (f"; {smoothed} neighbouring line(s) eased toward a fast line's speed" if smoothed else "")
     )
     return {
         "segments": [s.to_dict() for s in segments],
         "log": state.get("log", []) + ([clone_note] if clone_note else []) + [note],
     }
+
+
+def _smooth_rates(plan: list) -> int:
+    """
+    One line at 1.4× between two at 1.0× is a jarring jump in tempo. Lines of
+    the same speaker that follow closely (gap < _SMOOTH_GAP) are kept within
+    _MAX_JUMP of each other by speeding the slower one up — never slowing the
+    fast one (it would overrun) and never so much that the slower line stops
+    filling its own speech (≥ _SMOOTH_MIN_FILL of it). Returns lines changed.
+    """
+    changed = set()
+    by_spk: dict = {}
+    for row in plan:
+        by_spk.setdefault(row[0].speaker, []).append(row)
+    pairs = [(x, y) for rows in by_spk.values() for x, y in zip(rows, rows[1:])]
+    for _ in range(3):                     # let an adjustment ripple a little
+        for a, b in pairs + [(y, x) for x, y in pairs]:
+            sa, sb = a[0], b[0]
+            first, second = (sa, sb) if sa.start < sb.start else (sb, sa)
+            if second.start - first.end > _SMOOTH_GAP:
+                continue
+            target = a[3] - _MAX_JUMP
+            if b[3] >= target:
+                continue
+            dur = len(b[1]) / b[2]
+            cap = dur / (_SMOOTH_MIN_FILL * sb.duration) if sb.duration > 0 else target
+            new = min(target, cap)
+            if new > b[3] + 0.005:
+                b[3] = new
+                changed.add(sb.id)
+    return len(changed)
 
 
 def _clone_voices(segments: list[Segment], state: PipelineState, segs_dir) -> tuple[dict, str]:
