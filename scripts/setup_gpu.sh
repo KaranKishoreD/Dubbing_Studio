@@ -108,6 +108,31 @@ print("✓ LatentSync checkpoints downloaded")
 PY
 fi
 
+# ── 5b. Voice cloning: Seed-VC (GPL-3, run out of process) ────────────────────
+read -r -p "Clone Seed-VC for speaker voice cloning? (~1GB of weights) [y/N] " ans
+if [[ "${ans:-N}" =~ ^[Yy]$ ]]; then
+  [ -d dubbing/SeedVC ] || git clone --depth 1 https://github.com/Plachtaa/seed-vc dubbing/SeedVC
+  # Newer huggingface_hub no longer passes these to BigVGAN's loader.
+  sed -i -E 's/^(\s*)proxies: Optional\[Dict\],$/\1proxies: Optional[Dict] = None,/;
+             s/^(\s*)resume_download: bool,$/\1resume_download: bool = False,/' \
+      dubbing/SeedVC/modules/bigvgan/bigvgan.py
+  # Overlay venv: reuses the main venv's torch/transformers via a .pth file,
+  # adds only what Seed-VC needs on top. voice_clone.py runs it as a worker.
+  SVV=dubbing/SeedVC/.venv-vc
+  [ -d "$SVV" ] || python3 -m venv "$SVV"
+  python -c "import site;print(site.getsitepackages()[0])" \
+      > "$("$SVV/bin/python" -c "import site;print(site.getsitepackages()[0])")/zz_main_venv.pth"
+  "$SVV/bin/pip" install munch==4.0.0
+  # Only DAC's quantizer is imported; the full package pins old audio libs.
+  DAC="$("$SVV/bin/python" -c "import site;print(site.getsitepackages()[0])")/dac"
+  mkdir -p "$DAC/nn" && touch "$DAC/__init__.py" "$DAC/nn/__init__.py"
+  for f in quantize layers; do
+    curl -sL "https://raw.githubusercontent.com/descriptinc/descript-audio-codec/1.0.0/dac/nn/$f.py" \
+        -o "$DAC/nn/$f.py"
+  done
+  echo "✓ Seed-VC ready (weights download on first use)"
+fi
+
 # ── 6. Pre-warm the models that auto-download ─────────────────────────────────
 echo "▶ Pre-warming Whisper + Demucs (first run would otherwise stall)"
 python - <<'PY'

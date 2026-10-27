@@ -98,21 +98,8 @@ SARVAM_VOICES = [f"sarvam:{v}" for v in _SARVAM_FEMALE + _SARVAM_MALE]
 # Languages Bulbul speaks (BCP-47 with -IN).
 _SARVAM_LANGS = {"hi", "bn", "ta", "te", "kn", "ml", "mr", "gu", "pa", "or", "en"}
 
-# ── OpenAI gpt-audio-mini (via OpenRouter) ───────────────────────────────────
-# Speaks code-mixed lines the way bilingual people do: "relax" and "chill"
-# come out as English, where Bodhan says "rulox" / "sill". It is a chat model
-# that performs the text, so it can improvise (a 4 s line once came back as
-# 12.9 s). Every clip is therefore checked — length plausible for the text,
-# Whisper hears roughly the same words — retried, and on failure that line
-# falls back to Bodhan.
-GPT_AUDIO_MODEL = os.environ.get("GPT_AUDIO_MODEL", "openai/gpt-audio-mini")
-_GPT_FEMALE = ["shimmer", "coral", "nova", "sage"]
-_GPT_MALE = ["ash", "echo", "onyx", "ballad"]
-GPT_VOICES = [f"gptaudio:{v}" for v in _GPT_FEMALE + _GPT_MALE]
-_GPT_TRIES = int(os.environ.get("GPT_AUDIO_TRIES", "3"))
-
-ALL_VOICES = ALL_BODHAN_VOICES + SARVAM_VOICES + GPT_VOICES
-# "bodhan" | "sarvam" | "gptaudio" — which engine automatic casting draws from.
+ALL_VOICES = ALL_BODHAN_VOICES + SARVAM_VOICES
+# "bodhan" | "sarvam" — which engine automatic casting draws from.
 TTS_BACKEND = os.environ.get("TTS_BACKEND", "bodhan").lower()
 
 
@@ -120,19 +107,11 @@ def is_sarvam(voice: str | None) -> bool:
     return bool(voice) and voice.startswith("sarvam:")
 
 
-def is_gpt_audio(voice: str | None) -> bool:
-    return bool(voice) and voice.startswith("gptaudio:")
-
-
 def voice_label(voice: str | None) -> str:
-    """Display name: 'Anand (Sarvam)' / 'Shimmer (gpt-audio)' / 'Arun'."""
+    """Display name: 'Anand (Sarvam)' / 'Arun'."""
     if not voice:
         return "—"
-    if is_sarvam(voice):
-        return f"{voice.split(':', 1)[1].title()} (Sarvam)"
-    if is_gpt_audio(voice):
-        return f"{voice.split(':', 1)[1].title()} (gpt-audio)"
-    return voice
+    return f"{voice.split(':', 1)[1].title()} (Sarvam)" if is_sarvam(voice) else voice
 
 
 def _sarvam_gender(voice: str) -> str:
@@ -147,8 +126,6 @@ def voice_catalogue() -> list[tuple[str, str, str]]:
         for lang, voices in table.items():
             out += [(v, gender, lang) for v in voices]
     out += [(v, _sarvam_gender(v), "any") for v in SARVAM_VOICES]
-    out += [(v, "female" if v.split(":")[1] in _GPT_FEMALE else "male", "any")
-            for v in GPT_VOICES]
     return out
 
 
@@ -175,135 +152,29 @@ def _sarvam_tts(text: str, lang_code: str, voice: str) -> bytes:
 
 
 def _bodhan_tts(client, text: str, lang_code: str, voice: str, style: str) -> bytes:
-    """WAV bytes from Bodhan indic-speak. A rate limit (429) is retried with
-    back-off; without it, lines that hit a busy moment came out silent."""
+    """
+    WAV bytes from Bodhan indic-speak. A rate-limit reply (429) is waited
+    out and retried — 2, 4, 8, 16, 30 s — instead of leaving the line
+    undubbed (one Small talk line went silent on a single 429).
+    """
     import time
-    for attempt in range(5):
+    waits = [2, 4, 8, 16, 30]
+    for attempt in range(len(waits) + 1):
         try:
             return client.audio.speech.create(
                 model="indic-speak", input=text, voice=voice,
                 extra_body={"instructions": json.dumps({"lang": lang_code, "style": style})},
             ).content
         except Exception as exc:
-            if "429" not in str(exc) or attempt == 4:
+            if "429" not in str(exc) or attempt == len(waits):
                 raise
-            time.sleep(2 * (attempt + 1))
-
-
-_GPT_SYSTEM = (
-    "You are a voice actor dubbing a film. Read the user's line aloud EXACTLY as "
-    "written — every word, nothing added, nothing removed, nothing translated, no "
-    "greeting, no comment. Speak it the way a fluent {lang} speaker talks in "
-    "everyday conversation: relaxed and natural. Words written in English are "
-    "said as natural English, the way bilingual {lang} speakers say them. "
-    # Tested on the lines that failed: quoting the line plus a duration hint
-    # passed 8/8 (framing alone 6/8, duration alone 0/8, full gpt-audio 5/8).
-    "The user's message contains ONLY the line to read, between « and ». Say "
-    "exactly the text between the marks and nothing else — no other words, no "
-    "repetition, no pause filler. This line should take about {secs:.1f} "
-    "seconds to say; never pad it.")
-
-
-def _gpt_audio_once(text: str, lang_code: str, voice: str) -> tuple[bytes, float]:
-    """(wav bytes, seconds) from gpt-audio via OpenRouter."""
-    import base64
-    import io
-    import requests
-    import wave
-    from .translate import LANG_NAMES
-    from .. import tts_rate
-    r = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions", timeout=120, stream=True,
-        headers={"Authorization": "Bearer " + os.environ["OPENROUTER_API_KEY"]},
-        json={"model": GPT_AUDIO_MODEL, "modalities": ["text", "audio"], "stream": True,
-              "audio": {"voice": voice.split(":", 1)[1], "format": "pcm16"},
-              "messages": [{"role": "system", "content": _GPT_SYSTEM.format(
-                                lang=LANG_NAMES.get(lang_code, lang_code),
-                                secs=max(0.6, len(text) / tts_rate.chars_per_sec(lang_code)))},
-                           {"role": "user", "content": f"«{text}»"}]})
-    if r.status_code != 200:
-        raise RuntimeError(f"gpt-audio {r.status_code}: {r.text[:200]}")
-    pcm = bytearray()
-    for raw in r.iter_lines():
-        if not raw.startswith(b"data: ") or raw == b"data: [DONE]":
-            continue
-        for ch in json.loads(raw[6:]).get("choices", []):
-            a = (ch.get("delta") or {}).get("audio") or {}
-            if a.get("data"):
-                pcm += base64.b64decode(a["data"])
-    if not pcm:
-        raise RuntimeError("gpt-audio returned no audio")
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(24000)
-        w.writeframes(bytes(pcm))
-    return buf.getvalue(), len(pcm) / 48000
-
-
-def _gpt_audio_ok(wav: bytes, secs: float, text: str, lang_code: str) -> str:
-    """'' if the clip plausibly reads `text`, else the reason it failed."""
-    import io
-    import difflib
-    import re
-    from .. import tts_rate
-    expected = len(text) / tts_rate.chars_per_sec(lang_code)
-    if secs > 2.0 * expected + 1.0:
-        return f"too long ({secs:.1f}s for ~{expected:.1f}s of text)"
-    if secs < 0.4 * expected:
-        return f"too short ({secs:.1f}s for ~{expected:.1f}s of text)"
-    try:
-        import librosa
-        from .transcribe import _whisper
-        y, sr = sf_read(io.BytesIO(wav))
-        y = librosa.resample(y, orig_sr=sr, target_sr=16000)
-        segs, _ = _whisper()[0].transcribe(y, language=lang_code, beam_size=5,
-                                           vad_filter=False, condition_on_previous_text=False)
-        heard = " ".join(g.text.strip() for g in segs)
-    except Exception:
-        return ""                          # cannot verify → length check only
-    norm = lambda t: re.sub(r"[\W_]+", "", t.lower())
-    a, b = norm(text), norm(heard)
-    if not b:
-        return "nothing intelligible heard"
-    ratio = len(b) / max(1, len(a))
-    if ratio > 1.8:
-        return f"says more than the text (heard {len(b)} vs {len(a)} chars)"
-    if ratio < 0.45:
-        return f"says much less than the text (heard {len(b)} vs {len(a)} chars)"
-    # Script-independent overlap: English words may come back in Tamil script,
-    # so only flag clips that share almost nothing with the text.
-    if difflib.SequenceMatcher(None, a, b).ratio() < 0.15 and ratio > 1.3:
-        return "words do not match the text"
-    return ""
-
-
-def sf_read(f):
-    import soundfile as sf
-    y, sr = sf.read(f, dtype="float32", always_2d=True)
-    return y.mean(axis=1), sr
-
-
-def _gpt_audio_tts(text: str, lang_code: str, voice: str) -> bytes:
-    last = ""
-    for _ in range(_GPT_TRIES):
-        wav, secs = _gpt_audio_once(text, lang_code, voice)
-        last = _gpt_audio_ok(wav, secs, text, lang_code)
-        if not last:
-            return wav
-    raise GptAudioRejected(f"gpt-audio failed checks {_GPT_TRIES}× ({last})")
-
-
-class GptAudioRejected(RuntimeError):
-    pass
+            print(f"  … Bodhan rate limit — retrying in {waits[attempt]}s")
+            time.sleep(waits[attempt])
 
 
 def tts_bytes(text: str, lang_code: str, voice: str, style: str, client=None) -> bytes:
     if is_sarvam(voice):
         return _sarvam_tts(text, lang_code, voice)
-    if is_gpt_audio(voice):
-        return _gpt_audio_tts(text, lang_code, voice)
     return _bodhan_tts(client or _client(), text, lang_code, voice, style)
 
 
@@ -346,7 +217,6 @@ BODHAN_STYLES: dict[str, str] = {
 DEFAULT_STYLE_LABEL = "Auto (match original delivery)"
 DEFAULT_STYLE       = "auto"
 _AUTO_BASE_STYLE    = os.environ.get("AUTO_BASE_STYLE", "educational lecture")
-_PER_LINE_EMOTION   = os.environ.get("PER_LINE_EMOTION", "1") == "1"
 
 
 def _line_style(seg: Segment, global_style: str) -> str:
@@ -355,13 +225,8 @@ def _line_style(seg: Segment, global_style: str) -> str:
         return seg.style_override
     if global_style != "auto":
         return global_style
-    # One style per speaker for the whole video: switching styles line by line
-    # (calm → audiobook, neutral → lecture) changed the same person's voice
-    # mid-conversation. Only a clearly energetic line gets its own style.
-    if seg.delivery == "energetic" and _PER_LINE_EMOTION:
-        from ..prosody import BODHAN_FOR_DELIVERY
-        return BODHAN_FOR_DELIVERY.get("energetic", _AUTO_BASE_STYLE)
-    return _AUTO_BASE_STYLE
+    from ..prosody import BODHAN_FOR_DELIVERY
+    return BODHAN_FOR_DELIVERY.get(seg.delivery or "neutral", _AUTO_BASE_STYLE)
 
 
 def _client() -> OpenAI:
@@ -397,8 +262,6 @@ def _voice_pool(lang_code: str, gender: str, backend: str = "bodhan") -> list[st
     Sarvam voices are not tied to a language; they are ordered by measured
     pitch from the middle out, so the first picks sound typical, not extreme.
     """
-    if backend == "gptaudio":
-        return [v for v in GPT_VOICES if (v.split(":")[1] in _GPT_FEMALE) == (gender == "female")]
     if backend == "sarvam" and lang_code in _SARVAM_LANGS:
         prof = voice_profiles()
         vs = [v for v in SARVAM_VOICES if _sarvam_gender(v) == gender]
@@ -416,6 +279,10 @@ def _voice_pool(lang_code: str, gender: str, backend: str = "bodhan") -> list[st
             if v not in ordered:
                 ordered.append(v)
     return ordered or [_DEFAULT_MALE if gender == "male" else _DEFAULT_FEMALE]
+
+
+# Usual speaking pitch per gender (Hz), for casting only.
+_F0_RANGE = {"male": (80, 175), "female": (160, 300)}
 
 
 def _assign_voices(
@@ -449,21 +316,40 @@ def _assign_voices(
     # Whoever talks most gets the target language's own voice — they carry
     # the video, so they should sound the most native.
     # Each speaker gets the unused voice whose MEASURED pitch is closest to
-    # theirs, so voice adaptation has little or nothing to shift (a large
-    # pitch shift is what sounds processed). The target language's own voices
-    # get a ~1.5 semitone preference so a native voice wins unless a foreign
-    # one is clearly closer. Without pitch data, pool order decides.
+    # theirs. The target language's own voices get a ~1.5 semitone
+    # preference so a native voice wins unless a foreign one is clearly
+    # closer. Without pitch data, pool order decides.
     import math
     prof = voice_profiles()
-    f0s: dict[int, list[float]] = {}
+    # Speaker pitch: duration-weighted median of their lines, clamped to the
+    # normal range for their gender. Laughs and tracker octave errors put
+    # single lines at 240–290 Hz for a ~145 Hz man; from two such lines a
+    # "male" voice at 208 Hz was cast, which swung wildly within lines.
+    f0s: dict[int, list[tuple[float, float]]] = {}
     for seg in segments:
         if seg.f0:
-            f0s.setdefault(seg.speaker if seg.speaker is not None else 0, []).append(seg.f0)
-    spk_f0 = {k: sorted(v)[len(v) // 2] for k, v in f0s.items()}
+            f0s.setdefault(seg.speaker if seg.speaker is not None else 0, []).append(
+                (seg.f0, max(seg.duration, 0.1)))
+    spk_f0 = {}
+    for k, v in f0s.items():
+        v.sort()
+        half, acc = sum(w for _, w in v) / 2, 0.0
+        for f, w in v:
+            acc += w
+            if acc >= half:
+                lo, hi = _F0_RANGE.get(speakers.get(k, ""), (60, 400))
+                spk_f0[k] = min(max(f, lo), hi)
+                break
     native = {v for v, _, lang in voice_catalogue() if lang == _LANG_ALIAS.get(lang_code, lang_code)}
 
     for gender in ("male", "female"):
         pool = _voice_pool(lang_code, gender, backend)
+        # Voices far outside the usual range for their gender (a "male"
+        # voice at 208 Hz) are only used when nothing else is left.
+        lo, hi = _F0_RANGE[gender]
+        typical = [v for v in pool if v in native
+                   or lo <= (prof.get(v, {}).get("f0") or (lo + hi) / 2) <= hi]
+        pool = typical or pool
         same = [s for s, g in speakers.items() if g == gender and s not in assignment]
         for spk in sorted(same, key=lambda s: -talk[s]):
             free = [v for v in pool if v not in used] or pool
@@ -473,7 +359,9 @@ def _assign_voices(
                 vf = prof.get(v, {}).get("f0")
                 if not target or not vf:
                     return k                       # no data: keep pool order
-                return abs(12 * math.log2(vf / target)) + (0 if v in native else 1.5)
+                # Native voices first: voice cloning replaces the timbre with
+                # the real speaker's, but pronunciation stays the TTS voice's.
+                return abs(12 * math.log2(vf / target)) + (0 if v in native else 24)
             voice = min(free, key=lambda v: cost(v, free.index(v)))
             used.add(voice)
             assignment[spk] = voice
@@ -503,8 +391,6 @@ def synthesize_node(state: PipelineState) -> dict:
 
     # One voice per speaker, decided before any synthesis.
     backend = (state.get("tts_backend") or TTS_BACKEND).lower()
-    if backend == "gptaudio" and not os.environ.get("OPENROUTER_API_KEY"):
-        backend = "bodhan"
     if backend == "sarvam" and not os.environ.get("SARVAM_API_KEY"):
         backend = "bodhan"
     voice_map = dict(state.get("voice_map") or {})
@@ -547,7 +433,7 @@ def synthesize_node(state: PipelineState) -> dict:
         # The cache key must include the voice and style. Keying on segment id
         # alone meant a re-run with a different voice silently returned the
         # previous take — the audio never changed however the casting did.
-        text = speak_text.get(seg.id, seg.dubbed_text)
+        text = _speakable(speak_text.get(seg.id, seg.dubbed_text))
         key = instruction_hash(
             f"{seg.edit_instruction or ''}|{voice}|{seg_style}|{text}"
         )
@@ -566,30 +452,21 @@ def synthesize_node(state: PipelineState) -> dict:
 
         last_exc: Exception | None = None
         for attempt, candidate in enumerate(fallbacks):
-            # A fallback take is cached under ITS voice. Saving it under the
-            # intended voice's name made every later run reuse the fallback
-            # audio while reporting the intended voice.
-            out_path = audio_path if not attempt else segs_dir / (
-                f"s{seg.id:04d}_dubbed_"
-                f"{instruction_hash(f'{seg.edit_instruction or chr(0)}|{candidate}|{seg_style}|{text}')}.wav")
             try:
                 audio = tts_bytes(text, lang_code, candidate, seg_style, client)
-                with open(out_path, "wb") as f:
+                with open(audio_path, "wb") as f:
                     f.write(audio)
                 if attempt:
                     print(f"  ⚠ seg {seg.id}: voice '{voice}' rejected; used '{candidate}'")
                     seg.voice = candidate
-                return seg.id, str(out_path)
+                return seg.id, str(audio_path)
             except Exception as exc:
                 last_exc = exc
-                if is_gpt_audio(candidate):
-                    gpt_fallbacks.append((seg.id, str(exc)))
 
         print(f"  ✗ seg {seg.id}: all voices failed ({last_exc})")
         return seg.id, None
 
     seg_map = {s.id: s for s in segments}
-    gpt_fallbacks: list[tuple[int, str]] = []
 
     def _run(batch: list[Segment]) -> int:
         done = 0
@@ -610,9 +487,7 @@ def synthesize_node(state: PipelineState) -> dict:
     # known, so measure this voice's actual speaking rate, give each
     # overrunning line a precise character budget, rewrite it shorter and
     # re-synthesize once. This is what keeps the dub from sounding rushed.
-    from .translate import latin_allowed
-    refit_note = _refit_overruns(segments, state.get("audio_path"), _run, lang_code,
-                                 latin_allowed(state))
+    refit_note = _refit_overruns(segments, state.get("audio_path"), _run, lang_code)
 
     styles: dict[str, int] = {}
     for s in to_synth:
@@ -626,12 +501,6 @@ def synthesize_node(state: PipelineState) -> dict:
     if swapped:
         notes.append(f"⚠ Sarvam does not speak {lang_code}; used Bodhan instead of "
                      + ", ".join(sorted(set(swapped))))
-    gpt_lines = [x for x in to_synth if is_gpt_audio(x.voice)]
-    if gpt_lines or gpt_fallbacks:
-        why = "; ".join(f"S{i}: {r.split('(')[-1].rstrip(')')}" for i, r in gpt_fallbacks[:6])
-        notes.append(f"✓ gpt-audio voiced {len(gpt_lines)} line(s)"
-                     + (f"; {len(gpt_fallbacks)} failed its checks and used Bodhan — {why}"
-                        if gpt_fallbacks else ", all passed the length and word checks"))
     if refit_note:
         notes.append(refit_note)
 
@@ -641,25 +510,25 @@ def synthesize_node(state: PipelineState) -> dict:
     }
 
 
-_REFIT_ROUNDS = int(os.environ.get("REFIT_ROUNDS", "3"))
-
-
-_MIN_FILL = float(os.environ.get("MIN_FILL", "0.85"))
+_REFIT_ROUNDS = int(os.environ.get("REFIT_ROUNDS", "2"))
+# Speed-up accepted before a line is rewritten shorter (see _refit_overruns).
+_REWRITE_ABOVE = float(os.environ.get("REWRITE_ABOVE_STRETCH", "1.15"))
+_REWRITE_SHORT = float(os.environ.get("REWRITE_SHORT_ABOVE_STRETCH", "1.3"))
+# A dub under this share of the original speech is lengthened (lines of at
+# least _GROW_MIN_SECS): a lecture line had 10.7 s of speech, 6.9 s of dub.
+_GROW_BELOW = float(os.environ.get("GROW_BELOW_FILL", "0.8"))
+_GROW_MIN_SECS = float(os.environ.get("GROW_MIN_SECS", "1.5"))
 
 
 def _refit_overruns(segments: list[Segment], audio_path: str | None, run,
-                    lang_code: str, latin: bool = False) -> str:
+                    lang_code: str) -> str:
     """
-    Rewrite-and-re-voice, up to _REFIT_ROUNDS times, any line whose real audio
-      - would need more than MAX_STRETCH speed-up (shortened), or
-      - ends well before the speaker stops talking: under _MIN_FILL of the
-        original line (expanded — restoring dropped meaning first). Without
-        this, short dubs left lips moving over silence.
-    Changing the words keeps the voice at a natural pace; stretching audio is
-    the last resort either way.
+    Rewrite-and-re-voice any line whose real audio would need more than
+    MAX_STRETCH speed-up, up to _REFIT_ROUNDS times. Shortening the words is
+    what keeps the voice at a natural pace; speeding it up is the last resort.
     """
     from .align import MAX_STRETCH, slot_seconds, trimmed_duration, _audio_len
-    from .translate import condense_to_budget, expand_to_window
+    from .translate import condense_to_budget, expand_to_fill
     from .. import tts_rate
 
     ordered = sorted(segments, key=lambda s: s.start)
@@ -692,30 +561,37 @@ def _refit_overruns(segments: list[Segment], audio_path: str | None, run,
         cps_by_voice = {v: sorted(rs)[len(rs) // 2] if len(rs) >= 2 else cps_all
                         for v, rs in rates.items()}
 
-        jobs, over, grow, under = [], [], [], []
+        jobs, over = [], []
         for seg, dur, slot in measured:
-            # Calibrate on THIS clip: Bodhan's rate swings 7–18 chars/s line to
-            # line (punctuation, style, English words), so a global average
-            # mispredicted every rewrite and the rounds oscillated. The line's
-            # own measured rate is the ruler for its new length.
-            n = len(seg.dubbed_text)
-            if dur / slot > MAX_STRETCH:
-                budget = int(n * (slot * (0.95 if rnd == 1 else 0.88)) / dur)
+            # Rewriting to save a few percent cost meaning and tone ("still"
+            # dropped, a casual goodbye turned ceremonial); a slightly
+            # faster line is better. A very short reply can only get terser,
+            # so it is sped up more before anyone rewrites it.
+            limit = max(MAX_STRETCH, _REWRITE_SHORT if slot < 1.5 else _REWRITE_ABOVE)
+            if dur / slot > limit:
+                cps = cps_by_voice.get(seg.voice or "?", cps_all)
+                # Aim under the cap so the re-voiced clip fits without stretching.
+                budget = int(slot * cps * (0.95 if rnd == 1 else 0.85))
                 jobs.append((seg.id, seg.dubbed_text, max(budget, 4)))
                 over.append(seg)
-            elif seg.duration >= 1.2 and dur < _MIN_FILL * seg.duration and dur < slot:
+        # Lines that end well before the speaker stops: lips keep moving in
+        # silence. Only clearly short ones, on lines long enough to matter.
+        grow, under = [], []
+        for seg, dur, slot in measured:
+            if (seg not in over and seg.duration >= _GROW_MIN_SECS
+                    and dur < _GROW_BELOW * seg.duration):
+                cps = cps_by_voice.get(seg.voice or "?", cps_all)
                 grow.append({"id": seg.id, "original": seg.text, "dub": seg.dubbed_text,
-                             "gender": seg.gender or "unknown",
-                             "min_chars": int(n * 0.92 * seg.duration / dur),
-                             "max_chars": int(n * min(slot, 1.03 * seg.duration) / dur)})
+                             "min_chars": int(0.9 * seg.duration * cps),
+                             "max_chars": int(min(slot, 1.05 * seg.duration) * cps)})
                 under.append(seg)
         if not jobs and not grow:
-            notes.append(f"✓ All clips fill their slots at natural pace "
+            notes.append(f"✓ All clips fit their slots at natural pace "
                          f"(measured {cps_all:.1f} chars/s)")
             break
 
         new = condense_to_budget(jobs) if jobs else {}
-        longer = expand_to_window(grow, lang_code, latin) if grow else {}
+        longer = expand_to_fill(grow, lang_code) if grow else {}
         redo = []
         for seg in over:
             if seg.id in new:
@@ -726,14 +602,31 @@ def _refit_overruns(segments: list[Segment], audio_path: str | None, run,
                 seg.dubbed_text = longer[seg.id]
                 redo.append(seg)
         if not redo:
-            notes.append(f"⚠ {len(jobs)} too-long and {len(grow)} too-short clip(s) could "
-                         "not be rewritten — the fitter will stretch them")
+            if jobs:
+                why = ("no OPENROUTER_API_KEY" if not os.environ.get("OPENROUTER_API_KEY")
+                       else "already as short as they can naturally be")
+                notes.append(f"⚠ {len(jobs)} clip(s) still too long for their slot ({why}) "
+                             "— they will be sped up")
+            if grow:
+                notes.append(f"⚠ {len(grow)} clip(s) end early — no natural way to lengthen "
+                             "them; left as they are")
             break
         run(redo)
-        notes.append(f"✓ Round {rnd}: re-voiced {sum(s in over for s in redo)} over-long "
-                     f"and {sum(s in under for s in redo)} too-short line(s) "
+        notes.append(f"✓ Round {rnd}: re-voiced {sum(s in over for s in redo)} over-long and "
+                     f"{sum(s in under for s in redo)} too-short line(s) "
                      f"(measured {cps_all:.1f} chars/s)")
     return "\n".join(notes)
+
+
+def _speakable(text: str) -> str:
+    """
+    Drop notation a voice cannot read. The translation step is asked to
+    write formulas as words; anything left ("R^d") made the voice say
+    something odd for the symbol. Letters and digits around it stay.
+    """
+    import re
+    t = re.sub(r"[\^_{}\\|~`]", " ", text or "")
+    return re.sub(r"\s{2,}", " ", t).strip()
 
 
 def _cast_summary(segments: list[Segment]) -> str:

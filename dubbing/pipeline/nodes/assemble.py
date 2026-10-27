@@ -217,6 +217,7 @@ def _overlay_synced(video_path: str, synced: list[dict], cache_dir: Path) -> str
     """
     fps = _video_fps(video_path)
     w, h = _video_size(video_path)
+    synced = _retime(synced, fps, cache_dir)
     src = video_path
     batches = [synced[i:i + _OVERLAY_BATCH] for i in range(0, len(synced), _OVERLAY_BATCH)]
     for b, batch in enumerate(batches):
@@ -228,7 +229,7 @@ def _overlay_synced(video_path: str, synced: list[dict], cache_dir: Path) -> str
         for k, piece in enumerate(batch, 1):
             a, b = piece["start"], piece["end"]
             parts.append(
-                f"[{k}:v]{_to_fps(fps)},scale={w}:{h},format=yuv420p,"
+                f"[{k}:v]{piece.get('filter') or _to_fps(fps)},scale={w}:{h},format=yuv420p,"
                 f"setpts=PTS-STARTPTS+{a:.3f}/TB[c{k}]")
             parts.append(
                 f"[{last}][c{k}]overlay=eof_action=pass:"
@@ -247,6 +248,36 @@ def _overlay_synced(video_path: str, synced: list[dict], cache_dir: Path) -> str
 # so other rates are rebuilt with motion-compensated interpolation. 25 fps
 # videos are untouched by this.
 _LS_FPS = 25.0
+
+
+def _rate(fps: str) -> float:
+    try:
+        num, _, den = fps.partition("/")
+        return float(num) / float(den or 1)
+    except ValueError:
+        return _LS_FPS
+
+
+def _retime(synced: list[dict], fps: str, cache_dir: Path) -> list[dict]:
+    """
+    Bring each 25 fps lip-synced clip to the video's frame rate. With a free
+    GPU, in-between frames are warped from optical flow (frame_interp.py);
+    otherwise ffmpeg blends neighbouring frames, which is near-instant and
+    fine for talking heads. CPU minterpolate took minutes per minute.
+    """
+    rate = _rate(fps)
+    if abs(rate - _LS_FPS) < 0.01:
+        return synced
+    from .. import frame_interp
+    out = []
+    for piece in synced:
+        p = Path(piece["path"])
+        conv = p.with_name(f"{p.stem}_{rate:g}fps.mp4")
+        if conv.exists() or frame_interp.convert(str(p), str(conv), rate, _LS_FPS):
+            out.append({**piece, "path": str(conv), "filter": f"fps={fps}"})
+        else:
+            out.append({**piece, "filter": f"framerate=fps={fps}"})
+    return out
 
 
 def _to_fps(fps: str) -> str:

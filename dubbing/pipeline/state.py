@@ -103,6 +103,9 @@ class PipelineState(TypedDict):
     voice_map: dict
     # How much English stays in the translation: pure | natural | heavy
     lang_mix: Optional[str]
+    # "indic": Bodhan translates every line, the LLM only the lines it fails;
+    # "llm": the LLM translates the whole dialogue.
+    translator: Optional[str]
     # Optional part of the video to dub, in seconds of the source video.
     # Only this range is downloaded and processed.
     clip_start: Optional[float]

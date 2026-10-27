@@ -41,6 +41,7 @@ GAP_GUARD = float(os.environ.get("GAP_GUARD_SECS", "0.08"))
 GAP_BORROW_MAX = float(os.environ.get("GAP_BORROW_MAX_SECS", "3.0"))
 _UNDERRUN = 0.95
 _FADE_MS = 80
+_EDGE_FADE_MS = 15
 _TRIM_TOP_DB = 40
 
 
@@ -69,14 +70,17 @@ def align_node(state: PipelineState) -> dict:
 
     counts = {"fits": 0, "slowed": 0, "sped": 0, "trimmed": 0}
     worst = 1.0
+    # Each TTS line re-voiced in its original speaker's voice (same length).
+    cloned, clone_note = _clone_voices(segments, state, segs_dir)
 
     for i, seg in enumerate(segments):
         if not seg.dubbed_audio:
             continue
-        stem = os.path.splitext(os.path.basename(seg.dubbed_audio))[0]
-        out = segs_dir / f"{stem}_fit_{MAX_STRETCH}_{HARD_MAX_STRETCH}_{MIN_RATE}.wav"
+        source = cloned.get(seg.id, seg.dubbed_audio)
+        stem = os.path.splitext(os.path.basename(source))[0]
+        out = segs_dir / f"{stem}_fit2_{MAX_STRETCH}_{HARD_MAX_STRETCH}_{MIN_RATE}.wav"
 
-        y, sr = _load_trimmed(seg.dubbed_audio)
+        y, sr = _load_trimmed(source)
         dur = len(y) / sr
         slot = slot_seconds(segments, i, total)
         need = dur / slot if slot > 0 else 1.0
@@ -89,75 +93,50 @@ def align_node(state: PipelineState) -> dict:
             else:
                 rate, status = 1.0, "fits"
         else:
-            rate = min(need, HARD_MAX_STRETCH)
+            # Never cut words off: a line still too long after rewriting is
+            # sped up exactly as much as it needs, even past HARD_MAX_STRETCH.
+            # Trimming had dropped phrase endings mid-sentence.
+            rate = need
             status = "sped"
 
         if not out.exists():
             y2 = _stretch(y, sr, rate) if abs(rate - 1.0) > 0.005 else y
-            max_len = int(slot * sr)
-            if len(y2) > max_len:
-                y2 = y2[:max_len].copy()
-                fade = min(int(sr * _FADE_MS / 1000), len(y2))
-                y2[-fade:] *= np.linspace(1.0, 0.0, fade)
+            # Short fades so no line starts or stops with a click.
+            f = min(int(sr * _EDGE_FADE_MS / 1000), len(y2) // 4)
+            if f > 0:
+                y2 = y2.copy()
+                y2[:f] *= np.linspace(0.0, 1.0, f, dtype=np.float32)
+                y2[-f:] *= np.linspace(1.0, 0.0, f, dtype=np.float32)
             sf.write(str(out), y2, sr)
 
         if need > HARD_MAX_STRETCH:
-            status = "trimmed"
+            status = "trimmed"          # counted as "over the limit", nothing is cut
+            print(f"  ⚠ line {seg.id}: needs {need:.2f}× to fit — sped up, no words cut")
         counts[status] += 1
         seg.aligned_audio = str(out)
 
     note = (
         f"✓ Fitted {sum(counts.values())} clips — {counts['fits']} as-is, "
         f"{counts['slowed']} slowed, {counts['sped']} sped up (≤{HARD_MAX_STRETCH}×), "
-        f"{counts['trimmed']} trimmed; worst need {worst:.2f}×"
+        f"{counts['trimmed']} over {HARD_MAX_STRETCH}× (sped up, not cut); worst need {worst:.2f}×"
     )
-    notes = [note]
-    adapt_note = _voice_adapt(segments, state, segs_dir)
-    if adapt_note:
-        notes.append(adapt_note)
     return {
         "segments": [s.to_dict() for s in segments],
-        "log": state.get("log", []) + notes,
+        "log": state.get("log", []) + ([clone_note] if clone_note else []) + [note],
     }
 
 
-def _voice_adapt(segments: list[Segment], state: PipelineState, segs_dir) -> str:
-    """Pitch / loudness / mic-colour matching of each fitted clip (voice_adapt.py)."""
-    from .. import voice_adapt as va
+def _clone_voices(segments: list[Segment], state: PipelineState, segs_dir) -> tuple[dict, str]:
+    """Seed-VC voice cloning (voice_clone.py); TTS voices if unavailable."""
+    from .. import voice_clone as vcl
     vocals_path = state.get("vocals_path")
-    if not va.ENABLED or not vocals_path or not os.path.exists(vocals_path):
-        return ""
+    if not vcl.available() or not vocals_path or not os.path.exists(vocals_path):
+        return {}, ""
     try:
-        voc, vsr = sf.read(vocals_path, dtype="float32", always_2d=True)
-        voc = voc.mean(axis=1)
-        models = va.build_models(segments, voc, vsr)
-        # What each speaker's DUB voice is like, from all their fitted clips.
-        by_spk: dict[int, list[np.ndarray]] = {}
-        sr0 = None
-        for s in segments:
-            if s.aligned_audio and os.path.exists(s.aligned_audio):
-                y, sr0 = sf.read(s.aligned_audio, dtype="float32", always_2d=True)
-                by_spk.setdefault(s.speaker or 0, []).append(y.mean(axis=1))
-        dub = {spk: (va._ltas(c, sr0), va._median_f0(np.concatenate(c), sr0))
-               for spk, c in by_spk.items()}
-        shifted = 0
-        for s in segments:
-            if not s.aligned_audio or not os.path.exists(s.aligned_audio):
-                continue
-            spk = s.speaker or 0
-            stem = os.path.splitext(os.path.basename(s.aligned_audio))[0]
-            out = segs_dir / f"{stem}_va.wav"
-            if not out.exists():
-                y, sr = sf.read(s.aligned_audio, dtype="float32", always_2d=True)
-                y2, info = va.adapt(y.mean(axis=1), sr, s, models[spk], *dub[spk])
-                sf.write(str(out), y2, sr)
-                shifted += int("pitch_st" in info)
-            s.aligned_audio = str(out)
-        return (f"✓ Voice adapted to each speaker (pitch ≤±{va._MAX_ST:g} st, loudness, "
-                f"mic colour)")
+        return vcl.clone_lines(segments, vocals_path, segs_dir.parent, segs_dir)
     except Exception as exc:
-        print(f"  ⚠ voice adaptation skipped: {exc}")
-        return "⚠ Voice adaptation skipped (see Server output)"
+        print(f"  ⚠ voice cloning skipped: {exc}")
+        return {}, "⚠ Voice cloning skipped — TTS voices used (see Server output)"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

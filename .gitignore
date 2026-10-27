@@ -35,6 +35,7 @@ models--*/
 dubbing/Wav2Lip/
 dubbing/LatentSync/
 dubbing/MuseTalk/
+dubbing/SeedVC/
 
 # ── Pipeline artifacts & media ────────────────────────────────────────────────
 dubbing/cache/
@@ -68,3 +69,4 @@ desktop.ini
 *.swp
 .claude/settings.local.json
 logs/
+backups/

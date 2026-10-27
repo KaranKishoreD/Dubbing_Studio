@@ -146,6 +146,10 @@ def _lipsync_latentsync(
 
     # Who is on screen, whose mouth moves, where the cuts are — once per video.
     faces = cache_dir / "faces.npz"
+    # Analyses made before head angle was recorded fall back to the strict
+    # frontal-only test and skip three-quarter shots: redo them once.
+    if faces.exists() and "yaw" not in np.load(faces).files:
+        faces.unlink()
     if not faces.exists():
         _run_worker(["--analyze", str(Path(video_path).resolve()), str(faces.resolve())],
                     cache_dir / "face_analysis.log")
@@ -613,7 +617,11 @@ def _extract_clip(video_path: str, out_path: str, start: float, end: float) -> N
 # Same person if face embeddings (ArcFace) are at least this similar.
 _FACE_SAME_SIM = float(os.environ.get("FACE_SAME_SIM", "0.40"))
 # Share of a shot's samples in which the speaker must be the main frontal face.
-_SHOT_FACE_FRAC = float(os.environ.get("SHOT_FACE_FRAC", "0.75"))
+# 0.75 dropped whole lines whose speaker was on screen throughout but
+# detected in only 60–72% of samples (missed frames, a split identity):
+# 58 s of 99 s synced on Small talk; 0.5 → 76 s. A shot where LatentSync
+# then loses the face keeps its original frames.
+_SHOT_FACE_FRAC = float(os.environ.get("SHOT_FACE_FRAC", "0.5"))
 # Yaw proxy = nose offset from the eye midpoint / eye distance. ~0.35 ≈ 20°,
 # ~0.7 ≈ 40° (three-quarter view).
 _MAX_YAW = float(os.environ.get("LIPSYNC_MAX_YAW", "0.7"))

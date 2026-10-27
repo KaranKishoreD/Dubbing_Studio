@@ -23,17 +23,8 @@ from openai import OpenAI
 from ..state import PipelineState, Segment
 from ..cache import get_cache_dir
 
-# Default: Indic — Bodhan translates every line; the LLM only fixes lines
-# that rule checks or the cheap screen flag.
 _TRANSLATOR = os.environ.get("TRANSLATOR", "indic").lower()
-# Opus 5.5 won the bake-off: every line inside its time window, fewest
-# review fixes, fastest. Screening uses a cheap model; Opus only fixes
-# lines that fail.
-TRANSLATE_MODEL = os.environ.get("TRANSLATE_MODEL", "anthropic/claude-opus-5.5")
-SCREEN_MODEL = os.environ.get("SCREEN_MODEL", "google/gemini-3.8-flash")
-# Shortening / lengthening / length-fit are mechanical rewording: a cheap
-# model (~5x cheaper than Opus). Opus only fixes flagged meaning problems.
-LENGTH_MODEL = os.environ.get("LENGTH_MODEL", "google/gemini-3.8-flash")
+TRANSLATE_MODEL = os.environ.get("TRANSLATE_MODEL", "anthropic/claude-sonnet-5.5")
 _REGISTER = os.environ.get("TRANSLATE_REGISTER", "spoken").lower()
 _CHUNK_LINES = int(os.environ.get("TRANSLATE_CHUNK_LINES", "40"))
 
@@ -62,7 +53,7 @@ English into {lang} for a voice-over that must sound natural and stay in sync.
 The input is JSON with:
   "context": the FULL transcript, for understanding only.
   "lines":   the lines to translate. Each has id, speaker, gender, seconds,
-             min_chars, max_chars, text.
+             budget_chars, text.
 
 Rules:
 1. Register: {register}
@@ -80,16 +71,13 @@ Rules:
    kidding" all have natural spoken equivalents).
 5. {mix}
    {script_rule}
-6. Length WINDOW: min_chars–max_chars is how many {lang} characters the
-   voice speaks in this line's time at a natural pace (measured, not
-   guessed). Land INSIDE the window.
-   - Above max_chars: say it the brief way a native speaker would — shorter
-     words, restructure — never by cutting meaning.
-   - Below min_chars: the dub would end while the speaker is still visibly
-     talking. Use the fuller natural phrasing a native speaker would use for
-     the WHOLE original sentence. Never pad with filler or new content.
-   Either way NEVER drop a clause, a connecting word (but, so, because,
-   then, only, also, still), a negation, a question, a name or a number.
+6. Length is a HARD limit: budget_chars is how many {lang} characters the
+   voice can speak in "seconds" at a natural pace (measured, not guessed).
+   Never exceed it. {lang} often needs more characters than English for the
+   same idea, so when a faithful translation runs long, say it the way a
+   native speaker would say it briefly — shorter words, drop filler,
+   restructure — instead of translating word for word. Keep the meaning
+   that matters; coming in well under the budget is fine.
 7. One output line per input line, same id. Do not merge, split, or move
    content between lines — each line plays at its own time.
 {extra}
@@ -182,8 +170,26 @@ def _bodhan_client() -> OpenAI:
 
 
 def _openrouter_client() -> OpenAI:
-    from .. import llm_budget
-    return llm_budget.client()
+    """
+    OpenRouter client with thinking capped on every call. Claude Sonnet 5.5
+    thinks by default there, billed as output ($10/M): a 2-minute dub cost
+    ~$0.70 instead of ~$0.11, nearly all hidden reasoning, for line edits
+    that need none.
+    """
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ["OPENROUTER_API_KEY"],
+    )
+    create = client.chat.completions.create
+
+    def no_thinking(**kw):
+        # Sonnet 5.5 rejects "off" ("Reasoning is mandatory"), so cap it at
+        # the smallest budget Anthropic allows: ≤ ~$0.01 of thinking per call.
+        kw.setdefault("extra_body", {}).setdefault("reasoning", {"max_tokens": 1024})
+        return create(**kw)
+
+    client.chat.completions.create = no_thinking
+    return client
 
 
 def _needs_openrouter(instruction: str) -> bool:
@@ -217,24 +223,14 @@ def translate_node(state: PipelineState) -> dict:
 
     seg_map = {s.id: s for s in segments}
     target_lang = state["target_lang"]
-    use_llm = _TRANSLATOR == "llm" and bool(os.environ.get("OPENROUTER_API_KEY"))
+    translator = (state.get("translator") or _TRANSLATOR).lower()
+    use_llm = translator == "llm" and bool(os.environ.get("OPENROUTER_API_KEY"))
     mix = (state.get("lang_mix") or LANG_MIX).lower()
     if mix not in _MIX_TEXT:
         mix = "standard"
 
-    translator = (state.get("translator") or _TRANSLATOR).lower()
-    if translator == "indic" and os.environ.get("BODHAN_TRANSLATE_KEY"):
-        # Indic mode: Bodhan indic-translate does the translation; the LLM only
-        # checks and corrects it below (meaning, gender agreement, naturalness,
-        # length). Lines Bodhan cannot translate fall back to the LLM.
-        failed = _translate_bodhan_parallel(pending, target_lang, seg_map)
-        if failed and use_llm:
-            failed = _translate_dialogue(failed, segments, target_lang, None,
-                                         state.get("domain"), mix=mix,
-                                         latin=latin_allowed(state))
-        notes = [f"✓ Translated {len(pending)} lines with Bodhan indic-translate (Indic mode)"
-                 + (f"; {len(failed)} could not be translated" if failed else "")]
-    elif use_llm:
+    directed_ids: set[int] = set()
+    if use_llm:
         # One group per instruction: plain lines together, each edit
         # instruction ("make it funny") as its own group.
         groups: dict[str | None, list[Segment]] = {}
@@ -263,31 +259,36 @@ def translate_node(state: PipelineState) -> dict:
                 bodhan_group.append(seg)
             else:
                 openrouter_groups.setdefault(instruction, []).append(seg)
+        failed: list[Segment] = []
         if bodhan_group:
-            _translate_bodhan_parallel(bodhan_group, target_lang, seg_map)
+            failed = _translate_bodhan_parallel(bodhan_group, target_lang, seg_map)
         for instruction, group in openrouter_groups.items():
             _translate_openrouter(group, target_lang, instruction, seg_map)
-        why = "TRANSLATOR=bodhan" if _TRANSLATOR != "llm" else "no OPENROUTER_API_KEY"
-        notes = [f"✓ Translated {len(pending)} lines line-by-line with Bodhan ({why})"]
+        # Indic first: the LLM only for lines Bodhan could not translate.
+        if failed and os.environ.get("OPENROUTER_API_KEY"):
+            _translate_dialogue(failed, segments, target_lang, None, state.get("domain"),
+                                mix=mix, latin=latin_allowed(state))
+        why = "Indic pipeline" if translator != "llm" else "no OPENROUTER_API_KEY"
+        notes = [f"✓ Translated {len(pending)} lines line-by-line with Bodhan ({why})"
+                 + (f"; {len(failed)} failed there and went to {TRANSLATE_MODEL}" if failed else "")]
+        # Bodhan sees one line at a time: no speaker, gender or conversation.
+        before = {s.id: s.dubbed_text for s in segments}
+        directed, split = direct_dub(segments, target_lang)
+        directed_ids = {s.id for s in segments if before.get(s.id) != s.dubbed_text}
+        if directed:
+            notes.append(f"✓ Dubbing director ({TRANSLATE_MODEL}): {directed} line(s) made "
+                         "natural — gender agreement, spoken register, consistent address, "
+                         "timing"
+                         + (f"; {split} line(s) held two speakers and were split" if split else ""))
 
     # Shorten anything that cannot be spoken in its slot. Doing this before
     # synthesis is what keeps the dub from sounding hurried — time-stretching
     # can then stay within a range the ear does not notice.
-    has_key = bool(os.environ.get("OPENROUTER_API_KEY"))
-    if has_key and _POLISH:
-        # In Indic mode this is the LLM correction of Bodhan's translation.
-        polished = native_polish(pending, segments, target_lang, mix, latin_allowed(state))
-        from .. import llm_budget
-        notes.append(f"✓ Checked every line (rules + {SCREEN_MODEL.split('/')[-1]} screen); "
-                     f"{polished} flagged line(s) fixed with {(REVIEW_MODEL or TRANSLATE_MODEL).split('/')[-1]}"
-                     f" — LLM spend so far ${llm_budget.spent():.3f}")
-    if has_key:
-        checked, fitted = fit_lengths(pending, segments, target_lang, mix, latin_allowed(state))
-        if checked:
-            notes.append(f"✓ Length fit: {checked} line(s) outside their time window, "
-                         f"{fitted} replaced by a better-fitting version")
-
-    shortened = _compress_overlong(segments, state["target_lang"])
+    # Lines the director just rewrote were written to their budget with the
+    # whole conversation in view; re-shortening them blind undid its
+    # register, address and meaning. Only lines it left alone are shortened
+    # here; the synthesize refit still catches real overruns from audio.
+    shortened = _compress_overlong(segments, state["target_lang"], skip=directed_ids)
     if shortened:
         notes.append(
             f"✓ Shortened {shortened} over-long segment(s) to fit their time slots"
@@ -341,8 +342,7 @@ def _translate_dialogue(
         lines = [{
             "id": s.id, "speaker": s.speaker, "gender": s.gender or "unknown",
             "seconds": budgets[s.id][0],
-            "min_chars": budgets[s.id][2],
-            "max_chars": budgets[s.id][1],
+            "budget_chars": budgets[s.id][1],
             "text": s.text,
             **({"alt_text": s.asr_alt} if s.asr_alt and s.asr_alt != s.text else {}),
         } for s in chunk]
@@ -353,12 +353,11 @@ def _translate_dialogue(
                       {"role": "user", "content": payload}],
             temperature=0.3,
             timeout=180,
-            max_tokens=12000,
         )
         items = _parse_items(resp.choices[0].message.content.strip())
         wanted = {s.id for s in chunk}
-        return {_as_id(it.get("id")): str(it["text"]).strip() for it in items
-                if isinstance(it, dict) and _as_id(it.get("id")) in wanted and it.get("text")}
+        return {it["id"]: str(it["text"]).strip() for it in items
+                if isinstance(it, dict) and it.get("id") in wanted and it.get("text")}
 
     done: dict[int, str] = {}
     with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as pool:
@@ -435,22 +434,17 @@ _CHARS_PER_SEC = float(os.environ.get("TTS_CHARS_PER_SEC", "14"))
 # so it only catches egregious overruns. synthesize_node re-checks with the
 # real clip lengths and shortens precisely.
 _OVERRUN_TRIGGER = float(os.environ.get("OVERRUN_TRIGGER", "1.15"))
+# A dub shorter than this share of its time budget leaves the speaker's lips
+# moving in silence (a lecture line: 10.7 s of speech, 6.9 s of dub).
+_MIN_FILL = float(os.environ.get("MIN_FILL", "0.85"))
 _BUDGET_BORROW = float(os.environ.get("BUDGET_BORROW_SECS", "0.6"))
 
 
-# The dub should cover most of the time the speaker is visibly talking: a line
-# that ends early leaves the original lips moving over silence (measured on
-# the office video: 1.6 s of silence at the end of a 10 s line, and a whole
-# clause dropped). So each line gets a minimum as well as a maximum length.
-_MIN_FILL = float(os.environ.get("MIN_FILL", "0.85"))
-
-
-def time_budgets(ordered: list[Segment], target_lang: str) -> dict[int, tuple[float, int, int]]:
+def time_budgets(ordered: list[Segment], target_lang: str) -> dict[int, tuple[float, int]]:
     """
-    {id: (seconds, max_chars, min_chars)} per line. Seconds is the line's real
-    slot — up to the next line, borrowing a little trailing silence. max_chars
-    fits that slot at the language's measured speaking rate; min_chars fills
-    _MIN_FILL of the time the original speaker actually talks.
+    {id: (seconds, budget_chars)} per line. Seconds is the line's real slot —
+    up to the next line, borrowing trailing silence — and characters come from
+    the voice's measured speaking rate in this language.
     """
     from .align import slot_seconds
     from ..tts_rate import chars_per_sec
@@ -461,11 +455,8 @@ def time_budgets(ordered: list[Segment], target_lang: str) -> dict[int, tuple[fl
         # target: a line written to fill 3 s of borrowed pause keeps talking
         # long after the speaker's mouth has stopped.
         secs = min(slot_seconds(ordered, i, None), s.duration + _BUDGET_BORROW)
-        max_chars = max(4, int(secs * cps * 0.95))
-        min_chars = min(int(max_chars * 0.9), int(s.duration * _MIN_FILL * cps))
-        out[s.id] = (round(secs, 2), max_chars, max(0, min_chars))
+        out[s.id] = (round(secs, 2), max(4, int(secs * cps * 0.95)))
     return out
-
 
 _COMPRESS_SYSTEM = """\
 You shorten dubbed subtitle lines so they can be spoken aloud in a fixed time.
@@ -475,11 +466,16 @@ Rewrite the text to fit within its budget while preserving meaning.
 
 Rules:
 1. Stay in the SAME language and script as the input. Do not translate.
-2. Preserve the core meaning. Drop filler, hedges and redundancy first.
+2. Preserve the meaning of EVERY clause — feelings and whom/what they are
+   about, contrast and concession ("though", "still", "but"), negation.
+   Drop only filler, hedges and repetition; never a clause.
 3. Keep technical terms, names and numbers intact.
 4. The result must read as natural, speakable prose — not clipped notes.
-5. Keep the same register (spoken vs formal) and the same gendered verb
-   endings and pronouns as the input line.
+5. Keep the same register (spoken vs formal), the same form of address
+   (informal stays informal), the same gendered verb endings and pronouns,
+   and any everyday English words, exactly as the input line has them.
+   Never swap in formal, ceremonial, literary or archaic words to save
+   characters — a casual line stays casual even if it ends up a little long.
 6. Never exceed the budget. Coming in under it is fine.
 
 Return ONLY valid JSON (no markdown):
@@ -487,7 +483,8 @@ Return ONLY valid JSON (no markdown):
 """
 
 
-def _compress_overlong(segments: list[Segment], target_lang: str) -> int:
+def _compress_overlong(segments: list[Segment], target_lang: str,
+                       skip: set[int] | None = None) -> int:
     """
     Rewrite segments whose text is too long to speak in their slot.
     Returns the number actually shortened. No-ops without an OpenRouter key.
@@ -498,7 +495,7 @@ def _compress_overlong(segments: list[Segment], target_lang: str) -> int:
     budgets = time_budgets(sorted(segments, key=lambda s: s.start), target_lang)
     jobs: list[tuple[Segment, int]] = []
     for seg in segments:
-        if not seg.dubbed_text:
+        if not seg.dubbed_text or seg.id in (skip or ()):
             continue
         budget = budgets[seg.id][1]
         if budget > 0 and len(seg.dubbed_text) > budget * _OVERRUN_TRIGGER:
@@ -550,316 +547,239 @@ def has_latin(text: str | None) -> bool:
     return bool(text) and bool(re.search(r"[A-Za-z]", text))
 
 
-# ── Review: meaning, naturalness, length ──────────────────────────────────────
-# One pass, after translation, that reads every line the way a native-speaking
-# dubbing editor would and fixes only what is wrong:
-#   - meaning: a dropped clause ("I know what you mean, I'm a bit the same"
-#     vanished), a dropped "but", a flipped negation;
-#   - naturalness: "நாலு வருஷமா இங்க, டிபார்ட்மெண்ட் மாறினேன்" where people say
-#     "நாலு வருஷத்துக்கு அப்புறம் department மாறினேன்";
-#   - length: outside the line's min–max window.
-_POLISH = os.environ.get("NATIVE_POLISH", "1") == "1"
-REVIEW_MODEL = os.environ.get("REVIEW_MODEL", "") or None   # default: TRANSLATE_MODEL
+_DIRECTOR_SYSTEM = """\
+You are a professional {lang} dubbing director and localization specialist.
+You get a video's dialogue: per line the speaker, the speaker's gender, the
+original line, the current {lang} dub (a line-by-line machine translation
+that knows nothing about who speaks), and a character budget that fits the
+time the speaker's mouth moves. Rewrite every dub line so the whole
+conversation sounds like real people talking in {lang}.
 
-_REVIEW_SYSTEM = """\
-You are a native {lang} speaker and senior dubbing editor checking a video's
-{lang} dub line by line. Each line has the original (English), the current
-{lang} dub, the speaker's gender and a measured length verdict.
-Neighbouring lines are given for context.
+First read the WHOLE dialogue and decide its tone: who these people are
+to each other, how casual or formal they are, and how people like them
+really talk in {lang} today. Every line — especially greetings, thanks,
+goodbyes and short replies — must sound like those people in that
+setting. Ceremonial, traditional or textbook phrases are wrong in casual
+talk even when they are short; a casual phrase spoken a little faster is
+always better than a formal one that fits.
 
-A line FAILS if any of these is true:
-  A. Meaning: anything in the original is missing or changed in the dub — a
-     clause, a connecting word (but, so, because, then, only, also, still),
-     a negation, a question, who did what, time order, a name or number.
-  B. Naturalness: a real {lang} speaker would not say it this way in
-     everyday speech (stiff, literal, bookish, translated-sounding).
-  C. Length: its "length" field says "too short" or "too long". The length
-     has already been measured for you — do NOT count characters yourself.
+Rules:
+1. GENDER (critical). Every first-person verb, adjective and past-tense
+   form must agree with the SPEAKER's gender; forms that refer to the
+   person addressed must agree with the OTHER speaker's gender.
+2. REGISTER. Modern, colloquial, spoken {lang} as people say it today in
+   the setting of the video — never literary, archaic, bookish or overly
+   Sanskritized/formal. Greetings, exclamations and small talk must be what
+   a native speaker would actually say (not a word-for-word calque).
+   Everyday English words that {lang} speakers normally use (office words,
+   tech terms, "weekend", "meeting") may stay English.
+3. ADDRESS CONSISTENCY. Pick ONE form of address between each pair of
+   speakers that fits their relationship (peers / colleagues → informal;
+   strangers, elders, an audience → respectful) and keep it identical in
+   every line. Never mix respectful and informal pronouns for the same
+   person.
+4. TIMING. The speaker's mouth moves for the whole line, so the dub must
+   FILL it: between min_chars and budget_chars, roughly the original's
+   syllable count. Too short leaves silent moving lips — then use fuller,
+   natural phrasing (complete sentences, the connectives and small words
+   people really say), never new facts. Up to ~15% over budget is fine
+   (spoken slightly faster); never trade tone or meaning for length.
+5. MEANING FIRST. Every clause of the original must be recognisable in
+   the dub: who does what, feelings AND what/whom they are about, and how
+   the parts relate (cause, contrast, concession). Never drop
+   negation, questions, contrast or concession words, or numbers. Keep
+   names as they are. If the budget is tight, cut filler words and
+   repetition — never a clause; a little over budget beats lost meaning.
+6. Same id, one output per input line, in {lang} script.
+8. SPEAKABLE. A voice reads the dub aloud. Write formulas, symbols,
+   variables, powers, sets, units and abbreviations the way the speaker
+   would SAY them in {lang} (as words), never as notation a voice cannot
+   read.
+7. TWO SPEAKERS IN ONE LINE. The speaker labels come from voice analysis,
+   which misses quick replies: a line may really be a short exchange
+   between two people. Only when the words clearly belong to
+   two people (a reply to what was just said, a returned greeting), give
+   that line as "turns" instead of "text": consecutive pieces, each with
+   the speaker who says it, its exact original words (copied from
+   "original", in order, together covering the whole line) and its dub.
+   Otherwise never use "turns".
 
-These lines were flagged by a checker ("flagged_because"). Confirm and fix
-the real problem; if a flag is wrong and the line is fine, leave it out.
-
-For every failing line, write the fixed line:
-  1. Complete meaning of the original, in the natural spoken way.
-  2. Speaker's gender agreement; same conversational register.
-  3. English words: {english_rule}
-  4. If it was too short/long, about that many characters longer/shorter.
-     Never pad with filler or invent content.
-
-Output ONLY the JSON array — no reasoning, no explanations, no counting:
-[{{"id": <int>, "failed": "A"|"B"|"C"|"AB"|..., "text": "<fixed {lang} line>"}}]
-Return [] if every line passes.
+Return ONLY JSON:
+[{{"id": <int>, "text": "<dub line>"}}
+ or {{"id": <int>, "turns": [{{"speaker": "Speaker N", "original": "<words>", "text": "<dub>"}}, ...]}}]
 """
 
 
-# ── Screening: decide WHICH lines need the expensive fix ─────────────────────
-# Reviewing every line with a top model cost ~$0.70 per 2-minute video.
-# Instead: free rule checks + a cheap pass/fail screen (no rewriting), and
-# the top model fixes only what was flagged. Biased toward flagging: a false
-# alarm costs one extra line of review, a miss ships a wrong dub.
-import re as _re
-
-_NEG_EN = _re.compile(r"\b(not|no|never|nothing|nobody|none|nor|cannot)\b|n't\b", _re.I)
-_BUT_EN = _re.compile(r"\b(but|however|though|although|yet)\b", _re.I)
-_RULES = {   # target-language markers (only where we know them reliably)
-    "ta": {"neg": ("இல்ல", "ல்ல", "மாட்ட", "வேண்டாம்", "கூடாது", "முடியாது", "ாத", "லை"),
-           "but": ("ஆனா", "ஆனால்", "இருந்தாலும்", "ஆனாலும்", "but")},
-    "hi": {"neg": ("नहीं", "न ", "मत", "कभी नहीं"), "but": ("लेकिन", "पर ", "मगर", "but")},
-}
-_SCREEN_SYSTEM = """\
-You check a {lang} dub against the original line by line. Do NOT rewrite.
-A line FAILS only if (a) meaning from the original is missing or changed —
-a clause, a connecting word like "but", a negation, a question, who/when,
-a name or number — or (b) a native {lang} speaker would clearly not say it
-that way. Minor wording differences that keep the meaning are a PASS.
-Return ONLY JSON listing failing lines with a short reason:
-[{{"id": <int>, "issue": "<what is missing or wrong, max 12 words>"}}]
-Return [] if all pass.
-"""
-
-
-def screen_lines(lines: list[Segment], target_lang: str) -> dict[int, str]:
-    """{id: reason} for lines that need fixing. Free rules + cheap screen."""
-    from .. import llm_budget
-    code = target_lang.split("-")[0]
-    lang = LANG_NAMES.get(code, code)
-    flags: dict[int, str] = {}
-    rules = _RULES.get(code)
-    for s in lines:
-        src, dub = s.text or "", s.dubbed_text or ""
-        if "?" in src and "?" not in dub:
-            flags[s.id] = "the question became a statement"
-        if rules and _NEG_EN.search(src) and not any(m in dub for m in rules["neg"]):
-            flags[s.id] = "the negation is missing"
-        if rules and _BUT_EN.search(src) and not any(m in dub for m in rules["but"]):
-            flags[s.id] = "the 'but' / contrast is missing"
-        if _re.findall(r"\d+", src) and not _re.findall(r"\d+", dub) and len(dub) < 2 * len(src):
-            flags.setdefault(s.id, "a number may be missing")
-    if lines and llm_budget.allow(0.02):
-        payload = [{"id": s.id, "original": s.text, "dub": s.dubbed_text} for s in lines]
-        try:
-            resp = _openrouter_client().chat.completions.create(
-                model=SCREEN_MODEL,
-                messages=[{"role": "system", "content": _SCREEN_SYSTEM.format(lang=lang)},
-                          {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-                temperature=0.0, timeout=120, max_tokens=1500)
-            for it in _parse_items(resp.choices[0].message.content.strip()):
-                if isinstance(it, dict) and _as_id(it.get("id")) is not None:
-                    flags.setdefault(_as_id(it["id"]), str(it.get("issue") or "flagged"))
-        except Exception as exc:
-            print(f"  ⚠ screening skipped: {exc}")
-    return flags
-
-
-def native_polish(lines: list[Segment], all_segments: list[Segment], target_lang: str,
-                  mix: str, latin: bool) -> int:
-    """Fix only the lines that fail screening or their length window.
-    Returns how many changed."""
-    from .. import llm_budget
-    code = target_lang.split("-")[0]
-    todo = [s for s in lines if s.dubbed_text and not s.keep_original]
-    if not todo or code == "en":
-        return 0
-    ordered_all = sorted(all_segments, key=lambda s: s.start)
-    b_all = time_budgets(ordered_all, target_lang)
-    issues = screen_lines(todo, target_lang)
-    for s in todo:
-        v = _length_verdict(len(s.dubbed_text), b_all[s.id][2], b_all[s.id][1])
-        if v != "ok":
-            issues[s.id] = (issues.get(s.id, "") + "; " if s.id in issues else "") + v
-    todo = [s for s in todo if s.id in issues]
-    if not todo or not llm_budget.allow(0.10):
-        return 0
-    lang = LANG_NAMES.get(code, code)
-    ordered = sorted(all_segments, key=lambda s: s.start)
-    budgets = time_budgets(ordered, target_lang)
-    pos = {s.id: k for k, s in enumerate(ordered)}
-    system = _REVIEW_SYSTEM.format(lang=lang, english_rule=_english_rule(lang, mix, latin))
-    changed = 0
-    for i in range(0, len(todo), _CHUNK_LINES):
-        chunk = todo[i:i + _CHUNK_LINES]
-        payload = []
-        for s in chunk:
-            k = pos[s.id]
-            payload.append({
-                "id": s.id, "gender": s.gender or "unknown",
-                "previous_original": ordered[k - 1].text if k > 0 else "",
-                "original": s.text, "dub": s.dubbed_text,
-                "next_original": ordered[k + 1].text if k + 1 < len(ordered) else "",
-                "length": _length_verdict(len(s.dubbed_text), budgets[s.id][2],
-                                          budgets[s.id][1]),
-                "flagged_because": issues.get(s.id, "")})
-        try:
-            resp = _openrouter_client().chat.completions.create(
-                model=REVIEW_MODEL or TRANSLATE_MODEL,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-                temperature=0.2, timeout=240, max_tokens=_MAX_OUT_TOKENS)
-            items = _parse_items(resp.choices[0].message.content.strip())
-        except Exception as exc:
-            print(f"  ⚠ review skipped for a chunk: {exc}")
-            continue
-        by_id = {s.id: s for s in chunk}
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            seg = by_id.get(_as_id(it.get("id")))
-            text = str(it.get("text") or "").strip()
-            if seg and text and text != seg.dubbed_text and script_ok(text, code, latin):
-                seg.dubbed_text = text
-                changed += 1
-    return changed
-
-
-def _as_id(x):
-    """Line ids come back as 3, "3", "S3" or 3.0 depending on the model."""
-    import re
-    if isinstance(x, bool) or x is None:
-        return None
-    if isinstance(x, (int, float)):
-        return int(x)
-    m = re.search(r"-?\d+", str(x))
-    return int(m.group()) if m else None
-
-
-def _length_verdict(n: int, lo: int, hi: int) -> str:
-    if n < lo:
-        return f"too short by ~{lo - n} characters"
-    if n > hi:
-        return f"too long by ~{n - hi} characters"
-    return "ok"
-
-
-# Every review-type call is capped: one review once returned 37,423 tokens
-# (counting Tamil characters aloud) and cost $0.39 for a 2-minute video.
-_MAX_OUT_TOKENS = int(os.environ.get("LLM_MAX_OUTPUT_TOKENS", "4000"))
-
-
-def _english_rule(lang: str, mix: str, latin: bool) -> str:
-    if mix == "pure":
-        return "use English only for names and terms with no common equivalent."
-    return ("keep the English words people really use, written in normal English "
-            "spelling." if latin else
-            f"keep the English words people really use, written in {lang} script.")
-
-
-# ── Length fit: candidates, pick the one that fits ───────────────────────────
-# Dubbing research: generating several translations of different lengths and
-# picking the best-fitting one beats speeding audio up or leaving silence.
-# Only lines still outside their window after review get this (one call).
-_FIT_SYSTEM = """\
-For each dubbed {lang} line below, write THREE alternative {lang} versions of
-the SAME original sentence, all complete in meaning (no clause, connective,
-negation or question dropped), all natural spoken {lang}, same speaker gender:
-  "concise": as short as a native speaker would naturally say it,
-  "natural": the normal way,
-  "full":    the fuller way a native speaker would say it (no filler).
-English words: {english_rule}
-Return ONLY JSON: [{{"id": <int>, "concise": "...", "natural": "...", "full": "..."}}]
-"""
-
-
-def fit_lengths(lines: list[Segment], all_segments: list[Segment], target_lang: str,
-                mix: str, latin: bool) -> tuple[int, int]:
-    """Re-fit lines whose length is outside their window. Returns (checked, fixed)."""
-    code = target_lang.split("-")[0]
-    if code == "en":
+def direct_dub(segments: list[Segment], target_lang: str) -> int:
+    """
+    One batched pass over the whole dialogue: gender agreement, colloquial
+    register, consistent address, and length within each line's time
+    budget. Returns how many lines changed. Lines whose rewrite comes back
+    longer than budget keep the previous text.
+    """
+    if not os.environ.get("OPENROUTER_API_KEY"):
         return 0, 0
-    ordered = sorted(all_segments, key=lambda s: s.start)
-    budgets = time_budgets(ordered, target_lang)
-    out = [s for s in lines if s.dubbed_text and not s.keep_original
-           and not (budgets[s.id][2] <= len(s.dubbed_text) <= budgets[s.id][1])]
-    if not out:
+    ordered = sorted([s for s in segments if s.dubbed_text and not s.keep_original],
+                     key=lambda s: s.start)
+    if not ordered:
         return 0, 0
-    from .. import llm_budget
-    if not llm_budget.allow(0.05):
-        return len(out), 0
-    lang = LANG_NAMES.get(code, code)
-    payload = [{"id": s.id, "gender": s.gender or "unknown", "original": s.text,
-                "current_dub": s.dubbed_text} for s in out]
+    budgets = time_budgets(sorted(segments, key=lambda s: s.start), target_lang)
+    payload = [{"id": s.id, "speaker": f"Speaker {(s.speaker or 0) + 1}",
+                "gender": s.gender or "unknown", "original": s.text,
+                "dub": s.dubbed_text, "min_chars": int(budgets[s.id][1] * _MIN_FILL),
+                "budget_chars": budgets[s.id][1]} for s in ordered]
+    lang = LANG_NAMES.get(target_lang.split("-")[0], target_lang)
     try:
         resp = _openrouter_client().chat.completions.create(
-            model=LENGTH_MODEL,
-            messages=[{"role": "system", "content": _FIT_SYSTEM.format(
-                          lang=lang, english_rule=_english_rule(lang, mix, latin))},
+            model=TRANSLATE_MODEL,
+            messages=[{"role": "system", "content": _DIRECTOR_SYSTEM.format(lang=lang)},
                       {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            temperature=0.3, timeout=240, max_tokens=_MAX_OUT_TOKENS)
+            temperature=0.2)
         items = _parse_items(resp.choices[0].message.content.strip())
     except Exception as exc:
-        print(f"  ⚠ length fit skipped: {exc}")
-        return len(out), 0
-    by_id = {s.id: s for s in out}
-    fixed = 0
+        print(f"  ⚠ dubbing-director pass skipped: {exc}")
+        return 0, 0
+    seg_map = {s.id: s for s in ordered}
+    changed = split = 0
     for it in items:
-        seg = by_id.get(_as_id(it.get("id"))) if isinstance(it, dict) else None
-        if not seg:
+        if not isinstance(it, dict) or it.get("id") not in seg_map:
             continue
-        lo, hi = budgets[seg.id][2], budgets[seg.id][1]
-        target = (lo + hi) / 2
-        cands = [str(it.get(k) or "").strip() for k in ("concise", "natural", "full")]
-        cands = [c for c in cands if c and script_ok(c, code, latin)] + [seg.dubbed_text]
-        # Prefer candidates inside the window; among those, the natural one
-        # nearest the middle. Otherwise whichever is nearest the window.
-        def dist(c):
-            n = len(c)
-            return 0 if lo <= n <= hi else min(abs(n - lo), abs(n - hi))
-        best = min(cands, key=lambda c: (dist(c), abs(len(c) - target)))
-        if best != seg.dubbed_text:
-            seg.dubbed_text = best
-            fixed += 1
-    return len(out), fixed
+        if isinstance(it.get("turns"), list) and len(it["turns"]) >= 2:
+            pieces = _split_turns(seg_map[it["id"]], it["turns"], segments)
+            if pieces:
+                segments.extend(pieces)
+                split += 1
+                changed += 1
+                continue
+        s, text = seg_map[it["id"]], str(it.get("text") or "").strip()
+        if not text or text == s.dubbed_text or not script_ok(text, target_lang.split("-")[0], latin=True):
+            continue
+        # A rewrite may grow a too-short line, but never past its budget
+        # unless it is still shorter than what it replaces.
+        if len(text) > budgets[s.id][1] * _OVERRUN_TRIGGER and len(text) >= len(s.dubbed_text):
+            continue
+        s.dubbed_text = text
+        changed += 1
+    return changed, split
+
+
+def _split_turns(seg: Segment, turns: list, segments: list[Segment]) -> list[Segment]:
+    """
+    Split `seg` into the speaker turns the director found, at Whisper's word
+    timestamps. `seg` becomes the first turn; the new segments for the rest
+    are returned. Nothing changes unless every turn maps onto the words.
+    """
+    import re
+    norm = lambda x: re.sub(r"[^a-z0-9\u0900-\u0dff]", "", x.lower())
+    words = [w for w in (seg.words or []) if norm(w.get("word", ""))]
+    speakers = {s.speaker for s in segments if s.speaker is not None}
+    gender = {}
+    for s in segments:
+        if s.speaker is not None and s.gender:
+            gender.setdefault(s.speaker, s.gender)
+    parsed = []
+    for t in turns:
+        if not isinstance(t, dict):
+            return []
+        m = re.search(r"(\d+)", str(t.get("speaker", "")))
+        spk = int(m.group(1)) - 1 if m else None
+        toks = [norm(x) for x in str(t.get("original", "")).split() if norm(x)]
+        text = str(t.get("text") or "").strip()
+        if spk not in speakers or not toks or not text:
+            return []
+        parsed.append((spk, toks, text))
+    # Align the turns' words with Whisper's timed words. The line's text and
+    # its timings can differ slightly ("Yeah" attached to the line before),
+    # so match fuzzily and take each turn's first matched word as its start.
+    import difflib
+    flat = [(n, x) for n, (_, toks, _) in enumerate(parsed) for x in toks]
+    wt = [norm(w["word"]) for w in words]
+    pos: dict[int, int] = {}
+    for blk in difflib.SequenceMatcher(None, [x for _, x in flat], wt, autojunk=False).get_matching_blocks():
+        for i in range(blk.size):
+            pos[blk.a + i] = blk.b + i
+    starts, i = [], 0
+    for n, (_, toks, _) in enumerate(parsed):
+        idx = [pos[j] for j in range(i, i + len(toks)) if j in pos]
+        if len(idx) < max(1, len(toks) // 2):
+            return []
+        starts.append(0 if n == 0 else idx[0])
+        i += len(toks)
+    if any(b <= a for a, b in zip(starts, starts[1:])):
+        return []
+    bounds = starts + [len(words)]
+    spans = [(bounds[n], bounds[n + 1], spk, text) for n, (spk, _, text) in enumerate(parsed)]
+    if len({sp for *_, sp, _ in spans}) < 2:
+        return []
+    next_id = max(s.id for s in segments) + 1
+    out = []
+    for n, (a, b, spk, text) in enumerate(spans):
+        ws = words[a:b]
+        piece = seg if n == 0 else Segment.from_dict(seg.to_dict())
+        if n:
+            piece.id, next_id = next_id, next_id + 1
+            out.append(piece)
+        piece.start, piece.end = round(ws[0]["start"], 3), round(ws[-1]["end"], 3)
+        piece.words = ws
+        piece.text = "".join(w["word"] for w in ws).strip()
+        piece.speaker, piece.gender = spk, gender.get(spk, piece.gender)
+        piece.dubbed_text = text
+        piece.voice = None
+    return out
 
 
 _EXPAND_SYSTEM = """\
-Each item is a dubbed {lang} line whose spoken audio ends well before the
-speaker stops talking on screen, so viewers see lips moving over silence.
-Rewrite it so it fills its time: between min_chars and max_chars characters.
+You are a {lang} dubbing writer. Each dubbed line below ends well before the
+speaker in the video stops talking, so their lips move in silence. Rewrite
+each dub so it naturally fills between min_chars and max_chars.
 
 How:
-1. First restore anything from the original (English) the dub left out —
-   clauses, connecting words (but, so, because, then, only, also), hedges
-   ("I mean", "maybe"), names. Most short dubs are short because they dropped
-   something.
-2. Then, if still short, use the fuller natural way a native speaker would say
-   the same thing. Never add facts, jokes or content that is not in the
-   original, and no meaningless filler.
-3. Natural spoken {lang}, same speaker gender, same register.
-   English words: {english_rule}
+- Say the original line more completely and the way a native speaker
+  really talks: full sentences instead of clipped ones, the connecting
+  words and small spoken particles that sound natural in context, details
+  the original line itself contains but the dub left out.
+- Same meaning, same tone and register, same form of address and gender
+  forms as the current dub; same language and script.
+Never:
+- add facts, opinions or anything the original does not say;
+- repeat words or phrases, stack fillers, or pad with "so, so", "you see",
+  "basically" and the like;
+- make it sound more formal, literary or textbook-like.
+If a line cannot be lengthened naturally, return it unchanged.
 
-Return ONLY JSON: [{{"id": <int>, "text": "<{lang} line>"}}]
+Return ONLY JSON: [{{"id": <int>, "text": "<dub line>"}}]
 """
 
 
-def expand_to_window(jobs: list[dict], target_lang: str, latin: bool) -> dict[int, str]:
-    """jobs: [{id, original, dub, gender, min_chars, max_chars}] → {id: longer line}."""
-    from .. import llm_budget
-    if not jobs or not os.environ.get("OPENROUTER_API_KEY") or not llm_budget.allow(0.05):
+def expand_to_fill(items: list[dict], lang_code: str) -> dict[int, str]:
+    """
+    {id: longer dub} for lines that end well before the speaker stops.
+    items: {"id", "original", "dub", "min_chars", "max_chars"}. One batched
+    call; a rewrite is kept only if it is longer and within max_chars.
+    """
+    if not items or not os.environ.get("OPENROUTER_API_KEY"):
         return {}
-    code = target_lang.split("-")[0]
-    lang = LANG_NAMES.get(code, code)
+    lang = LANG_NAMES.get(lang_code.split("-")[0], lang_code)
     try:
         resp = _openrouter_client().chat.completions.create(
-            model=LENGTH_MODEL,
-            messages=[{"role": "system", "content": _EXPAND_SYSTEM.format(
-                          lang=lang, english_rule=_english_rule(lang, LANG_MIX, latin))},
-                      {"role": "user", "content": json.dumps(jobs, ensure_ascii=False)}],
-            temperature=0.2, timeout=180, max_tokens=_MAX_OUT_TOKENS)
-        items = _parse_items(resp.choices[0].message.content.strip())
+            model=TRANSLATE_MODEL,
+            messages=[{"role": "system", "content": _EXPAND_SYSTEM.format(lang=lang)},
+                      {"role": "user", "content": json.dumps(items, ensure_ascii=False)}],
+            temperature=0.3)
+        out = _parse_items(resp.choices[0].message.content.strip())
     except Exception as exc:
-        print(f"  ⚠ underrun expansion skipped: {exc}")
+        print(f"  ⚠ lengthening skipped: {exc}")
         return {}
-    old = {j["id"]: j for j in jobs}
-    out = {}
-    for it in items:
-        if not isinstance(it, dict) or _as_id(it.get("id")) not in old:
+    want = {it["id"]: it for it in items}
+    result = {}
+    for it in out:
+        if not isinstance(it, dict) or it.get("id") not in want:
             continue
-        text = str(it.get("text") or "").strip()
-        j = old[_as_id(it["id"])]
-        # Only a genuinely longer line that does not blow the maximum.
-        if (text and script_ok(text, code, latin) and len(text) > len(j["dub"])
-                and len(text) <= j["max_chars"] * 1.1):
-            out[_as_id(it["id"])] = text
-    return out
+        text, w = str(it.get("text") or "").strip(), want[it["id"]]
+        if (text and len(w["dub"]) < len(text) <= w["max_chars"] * 1.1
+                and script_ok(text, lang_code.split("-")[0], latin=True)):
+            result[it["id"]] = text
+    return result
 
 
 def condense_to_budget(jobs: list[tuple[int, str, int]]) -> dict[int, str]:
@@ -868,18 +788,17 @@ def condense_to_budget(jobs: list[tuple[int, str, int]]) -> dict[int, str]:
     Returns {id: shorter_text} for the ones that genuinely got shorter.
     Empty dict if no OpenRouter key or the call fails.
     """
-    from .. import llm_budget
-    if not jobs or not os.environ.get("OPENROUTER_API_KEY") or not llm_budget.allow(0.05):
+    if not jobs or not os.environ.get("OPENROUTER_API_KEY"):
         return {}
     payload = [{"id": i, "text": t, "budget_chars": b} for i, t, b in jobs]
     try:
         resp = _openrouter_client().chat.completions.create(
-            model=LENGTH_MODEL,
+            model=TRANSLATE_MODEL,
             messages=[
                 {"role": "system", "content": _COMPRESS_SYSTEM},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
-            temperature=0.2, max_tokens=_MAX_OUT_TOKENS,
+            temperature=0.2,
         )
         items = _parse_items(resp.choices[0].message.content.strip())
     except Exception as exc:
@@ -905,32 +824,40 @@ def condense_to_budget(jobs: list[tuple[int, str, int]]) -> dict[int, str]:
 def _translate_bodhan_parallel(
     group: list[Segment], target_lang: str, seg_map: dict[int, Segment]
 ) -> list[Segment]:
-    """Bodhan indic-translate, line by line, 4 at a time with back-off on rate
-    limits (10 at once with no retry crashed the step on the first 429).
-    Returns the lines that could not be translated."""
-    import time
+    """Fire all Bodhan translation requests simultaneously; returns the lines that failed."""
     client = _bodhan_client()
 
-    def _translate_one(seg: Segment) -> tuple[int, str | None]:
-        for attempt in range(5):
+    def _translate_one(seg: Segment) -> tuple[int, str]:
+        import time
+        # A rate-limit reply is waited out; otherwise the line would fall
+        # back to the paid LLM.
+        waits = [2, 4, 8, 16, 30]
+        for attempt in range(len(waits) + 1):
             try:
                 resp = client.chat.completions.create(
                     model="indic-translate",
                     messages=[{"role": "user", "content": seg.text}],
-                    extra_body={"target_language_code": target_lang,
-                                "target_script": "native"},
+                    extra_body={
+                        "target_language_code": target_lang,
+                        "target_script": "native",
+                    },
                 )
-                return seg.id, (resp.choices[0].message.content or "").strip() or None
+                return seg.id, resp.choices[0].message.content.strip()
             except Exception as exc:
-                if "429" not in str(exc) or attempt == 4:
-                    print(f"  ⚠ Bodhan translate failed for line {seg.id}: {exc}")
-                    return seg.id, None
-                time.sleep(2 * (attempt + 1))
-        return seg.id, None
+                if "429" not in str(exc) or attempt == len(waits):
+                    raise
+                time.sleep(waits[attempt])
 
-    failed = []
-    with ThreadPoolExecutor(max_workers=min(len(group), 4) or 1) as pool:
-        for seg_id, text in pool.map(_translate_one, group):
+    failed: list[Segment] = []
+    with ThreadPoolExecutor(max_workers=min(len(group), 10)) as pool:
+        futures = {pool.submit(_translate_one, seg): seg for seg in group}
+        for future in as_completed(futures):
+            try:
+                seg_id, text = future.result()
+            except Exception as exc:
+                print(f"  ⚠ Bodhan translation failed for line {futures[future].id}: {exc}")
+                failed.append(futures[future])
+                continue
             if text:
                 seg_map[seg_id].dubbed_text = text
             else:
