@@ -1,9 +1,25 @@
+"""
+Stage 1 — Download: fetch the video and make the two audio copies.
+
+  1. yt-dlp downloads the video (capped at 720p, H.264 preferred so it can
+     be copied into the output without re-encoding). If the user chose a
+     clip range, only that range is downloaded.
+  2. audio.wav: 16 kHz mono, used only for analysis (speech recognition,
+     voice activity, pitch).
+  3. audio_hq.wav: 44.1 kHz stereo, the base of the final mix, so the
+     output never inherits the low analysis quality.
+
+Title, channel and length are saved to meta.json for the project card.
+"""
+
 import os
+from pathlib import Path
+
 import ffmpeg
 import yt_dlp
-from pathlib import Path
-from ..state import PipelineState
+
 from ..cache import get_cache_dir
+from ..state import PipelineState
 
 
 def download_node(state: PipelineState) -> dict:
@@ -43,8 +59,10 @@ def download_node(state: PipelineState) -> dict:
         start, end = state.get("clip_start"), state.get("clip_end")
         if start is not None or end is not None:
             from yt_dlp.utils import download_range_func
+
             ydl_opts["download_ranges"] = download_range_func(
-                None, [(start or 0.0, end if end is not None else float("inf"))])
+                None, [(start or 0.0, end if end is not None else float("inf"))]
+            )
             ydl_opts["force_keyframes_at_cuts"] = True
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True) or {}
@@ -52,7 +70,9 @@ def download_node(state: PipelineState) -> dict:
             info = dict(info)
             full = info.get("duration") or 0
             info["duration"] = (end if end is not None else full) - (start or 0)
-            info["title"] = f"{info.get('title') or ''} [{_ts(start or 0)}–{_ts(end) if end is not None else 'end'}]"
+            info["title"] = (
+                f"{info.get('title') or ''} [{_ts(start or 0)}–{_ts(end) if end is not None else 'end'}]"
+            )
         _save_meta(cache_dir, url, info)
 
     # 16 kHz mono is what ASR wants, but it is phone-call quality. The final
@@ -60,8 +80,7 @@ def download_node(state: PipelineState) -> dict:
     # inherit that downgrade.
     if not audio_path.exists():
         (
-            ffmpeg
-            .input(str(video_path))
+            ffmpeg.input(str(video_path))
             .output(str(audio_path), ar=16000, ac=1, acodec="pcm_s16le")
             .overwrite_output()
             .run(quiet=True)
@@ -83,11 +102,17 @@ def _ts(t: float) -> str:
 def _save_meta(cache_dir: Path, url: str, info: dict) -> None:
     """Title, channel and length for the studio's project card."""
     import json
-    meta = {"url": url, "title": info.get("title"), "channel": info.get("channel")
-            or info.get("uploader"), "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail")}
-    (cache_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1),
-                                          encoding="utf-8")
+
+    meta = {
+        "url": url,
+        "title": info.get("title"),
+        "channel": info.get("channel") or info.get("uploader"),
+        "duration": info.get("duration"),
+        "thumbnail": info.get("thumbnail"),
+    }
+    (cache_dir / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
 
 
 def ensure_hq_audio(video_path: Path, cache_dir: Path) -> Path:
@@ -95,8 +120,7 @@ def ensure_hq_audio(video_path: Path, cache_dir: Path) -> Path:
     out = cache_dir / "audio_hq.wav"
     if not out.exists():
         (
-            ffmpeg
-            .input(str(video_path))
+            ffmpeg.input(str(video_path))
             .output(str(out), ar=44100, ac=2, acodec="pcm_s16le")
             .overwrite_output()
             .run(quiet=True)

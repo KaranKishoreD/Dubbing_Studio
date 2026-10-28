@@ -1,6 +1,12 @@
-from pathlib import Path
+"""
+Where each project's files live: cache/<project id>/, with one file per line
+under segments/. Everything a stage makes is saved here, which is what lets
+a re-run or an edit reuse finished work.
+"""
+
 import hashlib
 import re
+from pathlib import Path
 
 CACHE_ROOT = Path("cache")
 

@@ -15,6 +15,7 @@ __pycache__/
 *$py.class
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
 .ipynb_checkpoints/
 
 # ── Model weights (re-downloaded by scripts/setup_gpu.sh) ─────────────────────
@@ -36,9 +37,11 @@ dubbing/Wav2Lip/
 dubbing/LatentSync/
 dubbing/MuseTalk/
 dubbing/SeedVC/
+dubbing/Separator/
 
 # ── Pipeline artifacts & media ────────────────────────────────────────────────
 dubbing/cache/
+dubbing/compare/
 dubbing/.gradio/
 data/
 outputs/

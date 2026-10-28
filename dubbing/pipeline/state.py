@@ -1,7 +1,16 @@
+"""
+The data passed between stages.
+
+  Segment        one line of dialogue: its time, original text, speaker,
+                 translation and every audio/video file made for it.
+  PipelineState  the whole project: source video, settings chosen in the
+                 studio, all segments, and the run log.
+"""
+
 from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Optional, List, TypedDict
-import hashlib
+from typing import List, Optional, TypedDict
 
 
 @dataclass
@@ -21,13 +30,13 @@ class Segment:
     edit_hash: str = "default"
     # Set by diarize_node
     speaker: Optional[int] = None
-    gender: Optional[str] = None       # "male" | "female" | None if undetermined
-    f0: Optional[float] = None         # median fundamental frequency, Hz
-    voice: Optional[str] = None        # resolved Bodhan voice name
+    gender: Optional[str] = None  # "male" | "female" | None if undetermined
+    f0: Optional[float] = None  # median fundamental frequency, Hz
+    voice: Optional[str] = None  # resolved Bodhan voice name
     # Set by diarize_node via prosody.py: how the line was delivered relative
     # to the speaker's own baseline ("neutral", "energetic", "calm", ...).
     delivery: Optional[str] = None
-    pace: Optional[str] = None         # "quick" | "slow" | None
+    pace: Optional[str] = None  # "quick" | "slow" | None
     # Second transcription of the same audio (Whisper, when text came from
     # Bodhan). Passed to the translator to reconcile recognition errors.
     asr_alt: Optional[str] = None
@@ -50,12 +59,34 @@ class Segment:
     song_gender: Optional[str] = None
 
     _FIELDS = {
-        "id", "start", "end", "text", "lang", "words",
-        "dubbed_text", "dubbed_audio", "aligned_audio",
-        "lip_synced_clip", "original_clip", "edit_instruction", "edit_hash",
-        "speaker", "gender", "f0", "voice", "delivery", "pace", "asr_alt",
-        "sync_clips", "keep_original", "style_override", "asr_flag", "asr_raw",
-        "sung", "song_style", "song_gender",
+        "id",
+        "start",
+        "end",
+        "text",
+        "lang",
+        "words",
+        "dubbed_text",
+        "dubbed_audio",
+        "aligned_audio",
+        "lip_synced_clip",
+        "original_clip",
+        "edit_instruction",
+        "edit_hash",
+        "speaker",
+        "gender",
+        "f0",
+        "voice",
+        "delivery",
+        "pace",
+        "asr_alt",
+        "sync_clips",
+        "keep_original",
+        "style_override",
+        "asr_flag",
+        "asr_raw",
+        "sung",
+        "song_style",
+        "song_gender",
     }
 
     @property
@@ -86,20 +117,20 @@ class PipelineState(TypedDict):
     domain: str
     video_id: str
     video_path: Optional[str]
-    audio_path: Optional[str]          # 16 kHz mono — analysis only (ASR, VAD)
-    audio_hq_path: Optional[str]       # 44.1 kHz stereo — the base of the final mix
+    audio_path: Optional[str]  # 16 kHz mono — analysis only (ASR, VAD)
+    audio_hq_path: Optional[str]  # 44.1 kHz stereo — the base of the final mix
     vocals_path: Optional[str]
     background_path: Optional[str]
     voice_ref_path: Optional[str]
     segments: List[dict]
     final_video: Optional[str]
-    final_audio: Optional[str]         # the dubbed soundtrack alone, browser-playable
+    final_audio: Optional[str]  # the dubbed soundtrack alone, browser-playable
     edit_ops: List[dict]
     log: List[str]
     error: Optional[str]
     # Voice selection
-    voice_name: Optional[str]      # specific Bodhan voice (e.g. "Kavya", "Arjun")
-    voice_style: Optional[str]     # speaking style / mood (e.g. "happy", "educational lecture")
+    voice_name: Optional[str]  # specific Bodhan voice (e.g. "Kavya", "Arjun")
+    voice_style: Optional[str]  # speaking style / mood (e.g. "happy", "educational lecture")
     # Set by diarize_node: {speaker_id: {"gender", "f0", "n_segments"}}
     speaker_profiles: dict
     # Known speaker count from the UI; None = detect automatically

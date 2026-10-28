@@ -1,4 +1,0 @@
-  ⚠ dialogue translation chunk failed: 'NoneType' object has no attribute 'strip'
-  ⚠ review skipped for a chunk: 'NoneType' object has no attribute 'strip'
-  ⚠ length fit skipped: 'NoneType' object has no attribute 'strip'
-claude-opus-5.5 done 438 s 0.6974 USD 15 /25 inside

@@ -1,15 +1,31 @@
-from langgraph.graph import StateGraph, END
-from .state import PipelineState
-from .nodes.download import download_node
-from .nodes.separate import separate_node
-from .nodes.transcribe import transcribe_node
-from .nodes.diarize import diarize_node
-from .nodes.refine import refine_node
-from .nodes.translate import translate_node
-from .nodes.synthesize import synthesize_node
+"""
+The pipeline as LangGraph graphs. Each stage reads the shared state
+(state.py) and returns the fields it changed.
+
+  FULL_PIPELINE     download → separate → transcribe → diarize → refine →
+                    translate → synthesize → align → lipsync → assemble
+  EDIT_PIPELINE     translate → … → assemble. Used after a Revise request:
+                    speakers and transcript are already known.
+  REVOICE_PIPELINE  synthesize → … → assemble. Used when only the voices
+                    change; translations are kept.
+
+Every stage caches its work, so re-running a graph only redoes lines whose
+input changed.
+"""
+
+from langgraph.graph import END, StateGraph
+
 from .nodes.align import align_node
-from .nodes.lipsync import lipsync_node
 from .nodes.assemble import assemble_node
+from .nodes.diarize import diarize_node
+from .nodes.download import download_node
+from .nodes.lipsync import lipsync_node
+from .nodes.refine import refine_node
+from .nodes.separate import separate_node
+from .nodes.synthesize import synthesize_node
+from .nodes.transcribe import transcribe_node
+from .nodes.translate import translate_node
+from .state import PipelineState
 
 
 def _build(entry: str, edges: list[tuple[str, str]], nodes: dict) -> object:

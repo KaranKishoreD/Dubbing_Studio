@@ -1,24 +1,21 @@
 """
-Transcript refinement: an LLM reconciles the recognisers into one clean,
-faithful transcript before anything is translated.
+Stage 5 — Refine: one clean transcript before anything is translated.
 
-Each line arrives with up to two transcriptions of the same audio (Bodhan
-indic-transcribe and Whisper), which fail in different places: Bodhan can
-return junk ("ୄୄୄୄ") on a line Whisper heard fine, Whisper drifts into other
-scripts or misspells brands over music. Translating the wrong one turned a
-spoken question into "உருளைக்கிழங்கு". Here the model sees both, the
-neighbouring lines and the video title, and writes what was actually said —
-in the source language, never translated, never invented.
+Each line can have two transcriptions of the same audio, Bodhan
+indic-transcribe and Whisper, and they fail in different places: Bodhan can
+return junk on a line Whisper heard fine; Whisper can drift into another
+script or misspell names over music. An LLM sees both, the neighbouring
+lines and the video title, and writes what was actually said, in the source
+language, without translating or inventing anything.
 
 Per line it returns:
-  text        the corrected transcript ("[inaudible]" for words it cannot
-              recover from either recogniser)
-  confidence  high | low   — low lines are flagged in the Script tab
-  kind        speech | singing | noise — noise is left undubbed; anything
-              spoken or sung is dubbed
+  text        the corrected transcript ("[inaudible]" where neither
+              recogniser has the words)
+  confidence  high | low   (low lines are flagged in the Script tab)
+  kind        speech | singing | noise   (noise is left undubbed)
 
-Results are cached against a hash of their input, so a re-dub of an
-unchanged video reuses the same transcript instead of re-rolling it.
+Results are cached against a hash of their input, so re-dubbing an
+unchanged video reuses the same transcript.
 """
 
 import hashlib
@@ -28,8 +25,9 @@ import os
 from ..cache import get_cache_dir
 from ..state import PipelineState, Segment
 
-REFINE_MODEL = os.environ.get("REFINE_MODEL", os.environ.get("TRANSLATE_MODEL",
-                                                             "anthropic/claude-sonnet-5.5"))
+REFINE_MODEL = os.environ.get(
+    "REFINE_MODEL", os.environ.get("TRANSLATE_MODEL", "anthropic/claude-sonnet-5.5")
+)
 _ENABLED = os.environ.get("REFINE_TRANSCRIPT", "1") == "1"
 _CHUNK = 40
 
@@ -71,12 +69,19 @@ def refine_node(state: PipelineState) -> dict:
     cache_dir = get_cache_dir(state["video_id"])
     title = _title(cache_dir)
     ordered = sorted(segments, key=lambda s: s.start)
-    lines = [{"id": s.id, "time": f"{s.start:.1f}-{s.end:.1f}",
-              "speaker": (s.speaker or 0) + 1, "text": s.text,
-              **({"alt": s.asr_alt} if s.asr_alt and s.asr_alt != s.text else {})}
-             for s in ordered]
-    key = hashlib.sha1(json.dumps([REFINE_MODEL, title, lines], ensure_ascii=False)
-                       .encode()).hexdigest()[:16]
+    lines = [
+        {
+            "id": s.id,
+            "time": f"{s.start:.1f}-{s.end:.1f}",
+            "speaker": (s.speaker or 0) + 1,
+            "text": s.text,
+            **({"alt": s.asr_alt} if s.asr_alt and s.asr_alt != s.text else {}),
+        }
+        for s in ordered
+    ]
+    key = hashlib.sha1(
+        json.dumps([REFINE_MODEL, title, lines], ensure_ascii=False).encode()
+    ).hexdigest()[:16]
     cache_path = cache_dir / f"refined_{key}.json"
 
     if cache_path.exists():
@@ -86,12 +91,13 @@ def refine_node(state: PipelineState) -> dict:
         result = {}
         for i in range(0, len(lines), _CHUNK):
             try:
-                result.update(_call(title, lines, lines[i:i + _CHUNK]))
+                result.update(_call(title, lines, lines[i : i + _CHUNK]))
             except Exception as exc:
                 print(f"  ⚠ transcript refinement failed for lines {i}+: {exc}")
         if result:
-            cache_path.write_text(json.dumps(result, ensure_ascii=False, indent=1),
-                                  encoding="utf-8")
+            cache_path.write_text(
+                json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8"
+            )
         how = REFINE_MODEL.split("/")[-1]
 
     changed = low = noise = 0
@@ -115,32 +121,45 @@ def refine_node(state: PipelineState) -> dict:
             s.keep_original = True
             noise += 1
 
-    note = (f"✓ Transcript refined ({how}): {changed} line(s) corrected"
-            + (f", {low} uncertain (flagged)" if low else "")
-            + (f", {noise} non-speech left undubbed" if noise else ""))
+    note = (
+        f"✓ Transcript refined ({how}): {changed} line(s) corrected"
+        + (f", {low} uncertain (flagged)" if low else "")
+        + (f", {noise} non-speech left undubbed" if noise else "")
+    )
     if not result:
         note = "⚠ Transcript refinement failed — using the raw transcript"
     return {"segments": [s.to_dict() for s in segments], "log": log + [note]}
 
 
 def _call(title: str, all_lines: list[dict], chunk: list[dict]) -> dict[int, dict]:
-    from ..edit_resolver import extract_json_array
-    from .translate import _openrouter_client       # thinking off: see there
-    client = _openrouter_client()
+    from ..text.json_utils import extract_json_array
+    from ..text.llm import openrouter_client
+
+    client = openrouter_client()
     ids = {l["id"] for l in chunk}
     context = [l for l in all_lines if l["id"] not in ids]
-    payload = {"video_title": title, "lines_to_edit": chunk,
-               "other_lines_for_context": context[:80]}
+    payload = {
+        "video_title": title,
+        "lines_to_edit": chunk,
+        "other_lines_for_context": context[:80],
+    }
     resp = client.chat.completions.create(
         model=REFINE_MODEL,
-        messages=[{"role": "system", "content": _SYSTEM},
-                  {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-        temperature=0.0, timeout=180,
+        messages=[
+            {"role": "system", "content": _SYSTEM},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        temperature=0.0,
+        timeout=180,
     )
     items = extract_json_array(resp.choices[0].message.content.strip())
-    return {int(it["id"]): it for it in items
-            if isinstance(it, dict) and str(it.get("id", "")).lstrip("-").isdigit()
-            and int(it["id"]) in ids}
+    return {
+        int(it["id"]): it
+        for it in items
+        if isinstance(it, dict)
+        and str(it.get("id", "")).lstrip("-").isdigit()
+        and int(it["id"]) in ids
+    }
 
 
 def _title(cache_dir) -> str:

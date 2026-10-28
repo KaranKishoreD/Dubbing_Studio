@@ -1,15 +1,15 @@
 """
-Vocal separation with Demucs (htdemucs), run in-process.
+Stage 2 — Separate: split the voice from everything else with Demucs.
 
-Produces two stems from the full-quality 44.1 kHz stereo audio:
-  vocals → speech only. Cleaner input for diarization, pitch and onset work.
-  bed    → drums + bass + other. Everything except the voice: music, applause,
-           room tone. assemble_node splices this in under the dub, so the
-           original voice is removed outright instead of merely turned down.
+Two tracks are made from the full-quality audio:
+  vocals  speech only. Cleaner input for speech recognition, speaker
+          detection and pitch.
+  bed     music, effects, applause, room tone: everything but the voice.
+          The assemble stage puts this under the dub, so the original voice
+          is removed instead of just turned down.
 
-Audio I/O goes through soundfile, not torchaudio, so a torch/torchaudio
-version mismatch cannot break it. Falls back to the raw audio (and the old
-ducking mix) if Demucs is unavailable or SEPARATE=none.
+If Demucs is unavailable (or SEPARATE=none) the raw audio is used and the
+assemble stage turns the original voice down instead.
 """
 
 import os
@@ -81,6 +81,7 @@ def _load_model():
     global _model_cache
     if _model_cache is None:
         from demucs.pretrained import get_model
+
         _model_cache = get_model(_MODEL)
         _model_cache.eval()
     return _model_cache
@@ -88,6 +89,7 @@ def _load_model():
 
 def _run_demucs(src: Path, vocals_out: Path, bed_out: Path) -> float:
     import time
+
     import torch
     from demucs.apply import apply_model
 
@@ -95,15 +97,16 @@ def _run_demucs(src: Path, vocals_out: Path, bed_out: Path) -> float:
     model = _load_model()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    y, sr = sf.read(str(src), dtype="float32", always_2d=True)     # (n, ch)
+    y, sr = sf.read(str(src), dtype="float32", always_2d=True)  # (n, ch)
     if sr != model.samplerate:
         import librosa
+
         y = librosa.resample(y.T, orig_sr=sr, target_sr=model.samplerate).T
         sr = model.samplerate
     if y.shape[1] == 1:
         y = np.repeat(y, 2, axis=1)
 
-    wav = torch.from_numpy(y.T.copy())                             # (2, n)
+    wav = torch.from_numpy(y.T.copy())  # (2, n)
     # Same normalisation the demucs CLI applies.
     ref = wav.mean(0)
     mean, std = ref.mean(), ref.std() + 1e-8
@@ -111,9 +114,14 @@ def _run_demucs(src: Path, vocals_out: Path, bed_out: Path) -> float:
 
     with torch.no_grad():
         out = apply_model(
-            model, wav[None], device=device, shifts=0, split=True,
-            overlap=0.25, progress=False,
-        )[0]                                                       # (sources, 2, n)
+            model,
+            wav[None],
+            device=device,
+            shifts=0,
+            split=True,
+            overlap=0.25,
+            progress=False,
+        )[0]  # (sources, 2, n)
     out = out * std + mean
 
     idx = model.sources.index("vocals")

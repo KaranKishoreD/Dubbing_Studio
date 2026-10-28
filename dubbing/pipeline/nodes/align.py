@@ -1,24 +1,25 @@
 """
-Fit each dubbed clip into its slot on the original timeline.
+Stage 8 — Align: fit each dubbed line into the time the speaker talks.
 
-Modelled on VoiceStudio's fit planner:
+  1. Re-voice every line in the original speaker's own voice with Seed-VC
+     (voice/voice_clone.py). If that is unavailable the TTS voice is kept.
+  2. Trim the silence TTS engines leave at both ends of a clip.
+  3. Work out the line's slot: from its start until just before the next
+     line, borrowing up to GAP_BORROW_MAX seconds of following silence.
+     Two dubbed lines never overlap.
+  4. need = clip length / slot length
+       need <= 1 and the clip is much shorter than the original
+                     -> slow it down gently (not below MIN_RATE), so the
+                        voice does not stop while the mouth still moves
+       need <= 1 otherwise -> leave it as is
+       need > 1      -> speed it up by exactly what it needs. Words are
+                        never cut off; lines needing a lot were already
+                        rewritten shorter in the synthesize stage.
+  5. Smooth the tempo between close lines of the same speaker, so one fast
+     line between two normal ones does not jump out.
 
-  1. Trim the TTS clip's leading/trailing silence. TTS engines pad both ends,
-     which inflates the length and pushes the voice late.
-  2. Slot = from the segment's start up to just before the next segment
-     starts, borrowing at most GAP_BORROW_MAX seconds of following silence.
-     The dub never runs into the next line, so two voices never overlap.
-  3. need = clip / slot
-       need ≤ 1, clip much shorter than the original line → slow gently
-                  (≥ MIN_RATE) so the voice does not finish while the speaker
-                  is visibly still talking
-       need ≤ 1 otherwise → untouched
-       1 < need          → speed up, capped at MAX_STRETCH
-  4. Anything still longer than the slot is trimmed with a short fade. The
-     synthesize step shortens the text of such lines first, so this is rare.
-
-The cache key is the dubbed clip's own filename (which encodes voice, style
-and text), so a re-cast or re-translation always re-aligns.
+The output file name includes the source clip name and the rate, so a
+re-cast or re-translated line is always aligned again.
 """
 
 import os
@@ -33,23 +34,22 @@ from ..state import PipelineState, Segment
 # Speed-up the ear does not notice. Lines needing more are rewritten shorter
 # and re-voiced by synthesize_node first, so beyond this is rare.
 MAX_STRETCH = float(os.environ.get("MAX_STRETCH", "1.10"))
-# Last resort for lines that still overrun after rewriting: audibly faster,
-# but better than cutting words off. Only past this is a clip trimmed.
+# Lines that need more speed-up than this are still sped up (never cut),
+# but are reported in the log, since the change is audible.
 HARD_MAX_STRETCH = float(os.environ.get("HARD_MAX_STRETCH", "1.25"))
-MIN_RATE = float(os.environ.get("MIN_RATE", "0.90"))
-GAP_GUARD = float(os.environ.get("GAP_GUARD_SECS", "0.08"))
+MIN_RATE = float(os.environ.get("MIN_RATE", "0.90"))  # slowest a short line is played
+GAP_GUARD = float(os.environ.get("GAP_GUARD_SECS", "0.08"))  # silence kept before the next line
 # How far a dub may run past the end of the speaker's line into silence.
-# 3 s let a dub keep talking long after the mouth closed or into the next
-# shot (fast-cut trailers); a short overhang is all speech needs.
+# Much more than a second keeps the voice going after the mouth has closed,
+# or into the next shot.
 GAP_BORROW_MAX = float(os.environ.get("GAP_BORROW_MAX_SECS", "1.0"))
-_UNDERRUN = 0.95
-_FADE_MS = 80
-_EDGE_FADE_MS = 15
+_UNDERRUN = 0.95  # a clip under 95% of the original line is slowed
+_EDGE_FADE_MS = 15  # fade in/out on every clip, so none starts with a click
 # Speed smoothing between close lines of one speaker (see _smooth_rates).
 _MAX_JUMP = float(os.environ.get("MAX_SPEED_JUMP", "0.15"))
 _SMOOTH_GAP = float(os.environ.get("SMOOTH_GAP_SECS", "1.0"))
 _SMOOTH_MIN_FILL = 0.85
-_TRIM_TOP_DB = 40
+_TRIM_TOP_DB = 40  # quieter than this (dB below peak) counts as silence
 
 
 def slot_seconds(segments: list[Segment], i: int, total: float | None) -> float:
@@ -69,9 +69,7 @@ def trimmed_duration(path: str) -> float:
 
 
 def align_node(state: PipelineState) -> dict:
-    segments = sorted(
-        [Segment.from_dict(s) for s in state["segments"]], key=lambda s: s.start
-    )
+    segments = sorted([Segment.from_dict(s) for s in state["segments"]], key=lambda s: s.start)
     segs_dir = get_segments_dir(state["video_id"])
     total = _audio_len(state.get("audio_path"))
 
@@ -80,7 +78,7 @@ def align_node(state: PipelineState) -> dict:
     # Each TTS line re-voiced in its original speaker's voice (same length).
     cloned, clone_note = _clone_voices(segments, state, segs_dir)
 
-    plan = []                      # [seg, y, sr, rate, need, out]
+    plan = []  # [seg, y, sr, rate, need, out]
     for i, seg in enumerate(segments):
         if not seg.dubbed_audio:
             continue
@@ -95,7 +93,6 @@ def align_node(state: PipelineState) -> dict:
         else:
             # Never cut words off: a line still too long after rewriting is
             # sped up exactly as much as it needs, even past HARD_MAX_STRETCH.
-            # Trimming had dropped phrase endings mid-sentence.
             rate = need
         plan.append([seg, y, sr, rate, need, source])
 
@@ -114,7 +111,7 @@ def align_node(state: PipelineState) -> dict:
                 y2[-f:] *= np.linspace(1.0, 0.0, f, dtype=np.float32)
             sf.write(str(out), y2, sr)
         if need > HARD_MAX_STRETCH:
-            status = "trimmed"          # counted as "over the limit", nothing is cut
+            status = "trimmed"  # counted as "over the limit", nothing is cut
             print(f"  ⚠ line {seg.id}: needs {need:.2f}× to fit — sped up, no words cut")
         else:
             status = "sped" if rate > 1.005 else "slowed" if rate < 0.995 else "fits"
@@ -125,7 +122,11 @@ def align_node(state: PipelineState) -> dict:
         f"✓ Fitted {sum(counts.values())} clips — {counts['fits']} as-is, "
         f"{counts['slowed']} slowed, {counts['sped']} sped up (≤{HARD_MAX_STRETCH}×), "
         f"{counts['trimmed']} over {HARD_MAX_STRETCH}× (sped up, not cut); worst need {worst:.2f}×"
-        + (f"; {smoothed} neighbouring line(s) eased toward a fast line's speed" if smoothed else "")
+        + (
+            f"; {smoothed} neighbouring line(s) eased toward a fast line's speed"
+            if smoothed
+            else ""
+        )
     )
     return {
         "segments": [s.to_dict() for s in segments],
@@ -146,7 +147,7 @@ def _smooth_rates(plan: list) -> int:
     for row in plan:
         by_spk.setdefault(row[0].speaker, []).append(row)
     pairs = [(x, y) for rows in by_spk.values() for x, y in zip(rows, rows[1:])]
-    for _ in range(3):                     # let an adjustment ripple a little
+    for _ in range(3):  # let an adjustment ripple a little
         for a, b in pairs + [(y, x) for x, y in pairs]:
             sa, sb = a[0], b[0]
             first, second = (sa, sb) if sa.start < sb.start else (sb, sa)
@@ -166,7 +167,8 @@ def _smooth_rates(plan: list) -> int:
 
 def _clone_voices(segments: list[Segment], state: PipelineState, segs_dir) -> tuple[dict, str]:
     """Seed-VC voice cloning (voice_clone.py); TTS voices if unavailable."""
-    from .. import voice_clone as vcl
+    from ..voice import voice_clone as vcl
+
     vocals_path = state.get("vocals_path")
     if not vcl.available() or not vocals_path or not os.path.exists(vocals_path):
         return {}, ""
@@ -179,8 +181,10 @@ def _clone_voices(segments: list[Segment], state: PipelineState, segs_dir) -> tu
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
 def _load_trimmed(path: str) -> tuple[np.ndarray, int]:
     import librosa
+
     y, sr = sf.read(path, dtype="float32", always_2d=True)
     y = y.mean(axis=1)
     if y.size == 0:
@@ -203,17 +207,24 @@ def _stretch(y: np.ndarray, sr: int, rate: float) -> np.ndarray:
     """rate > 1 = faster/shorter. Rubberband if available, else ffmpeg atempo."""
     try:
         import pyrubberband as pyrb
+
         return pyrb.time_stretch(y, sr, rate=rate).astype(np.float32)
     except (ImportError, RuntimeError, OSError):
         pass
     import tempfile
+
     with tempfile.TemporaryDirectory() as tmp:
         src, dst = os.path.join(tmp, "in.wav"), os.path.join(tmp, "out.wav")
         sf.write(src, y, sr)
-        f = (f"atempo=0.5,atempo={rate / 0.5:.4f}" if rate < 0.5 else
-             f"atempo=2.0,atempo={rate / 2.0:.4f}" if rate > 2.0 else
-             f"atempo={rate:.4f}")
-        subprocess.run(["ffmpeg", "-i", src, "-filter:a", f, dst, "-y"],
-                       check=True, capture_output=True)
+        f = (
+            f"atempo=0.5,atempo={rate / 0.5:.4f}"
+            if rate < 0.5
+            else f"atempo=2.0,atempo={rate / 2.0:.4f}"
+            if rate > 2.0
+            else f"atempo={rate:.4f}"
+        )
+        subprocess.run(
+            ["ffmpeg", "-i", src, "-filter:a", f, dst, "-y"], check=True, capture_output=True
+        )
         out, _ = sf.read(dst, dtype="float32", always_2d=True)
         return out.mean(axis=1)
