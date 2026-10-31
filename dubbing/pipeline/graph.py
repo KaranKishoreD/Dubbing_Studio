@@ -4,10 +4,12 @@ The pipeline as LangGraph graphs. Each stage reads the shared state
 
   FULL_PIPELINE     download → separate → transcribe → diarize → refine →
                     translate → synthesize → align → lipsync → assemble
-  EDIT_PIPELINE     translate → … → assemble. Used after a Revise request:
+  EDIT_PIPELINE     translate → … → assemble. Used after a change request:
                     speakers and transcript are already known.
   REVOICE_PIPELINE  synthesize → … → assemble. Used when only the voices
                     change; translations are kept.
+  LIPSYNC_PIPELINE  lipsync → assemble. Adds lip sync later to lines made in
+                    fast mode (state "lipsync": False, see steps/lipsync.py).
 
 Every stage caches its work, so re-running a graph only redoes lines whose
 input changed.
@@ -15,17 +17,17 @@ input changed.
 
 from langgraph.graph import END, StateGraph
 
-from .nodes.align import align_node
-from .nodes.assemble import assemble_node
-from .nodes.diarize import diarize_node
-from .nodes.download import download_node
-from .nodes.lipsync import lipsync_node
-from .nodes.refine import refine_node
-from .nodes.separate import separate_node
-from .nodes.synthesize import synthesize_node
-from .nodes.transcribe import transcribe_node
-from .nodes.translate import translate_node
 from .state import PipelineState
+from .steps.align import align_node
+from .steps.assemble import assemble_node
+from .steps.diarize import diarize_node
+from .steps.download import download_node
+from .steps.lipsync import lipsync_node
+from .steps.refine import refine_node
+from .steps.separate import separate_node
+from .steps.synthesize import synthesize_node
+from .steps.transcribe import transcribe_node
+from .steps.translate import translate_node
 
 
 def _build(entry: str, edges: list[tuple[str, str]], nodes: dict) -> object:
@@ -89,4 +91,12 @@ REVOICE_PIPELINE = _build(
     entry="synthesize",
     edges=_SHARED_EDGES[1:],
     nodes={k: v for k, v in _SHARED_NODES.items() if k != "translate"},
+)
+
+
+# Add lip sync later to lines made in fast mode.
+LIPSYNC_PIPELINE = _build(
+    entry="lipsync",
+    edges=[("lipsync", "assemble"), ("assemble", "END")],
+    nodes={"lipsync": lipsync_node, "assemble": assemble_node},
 )

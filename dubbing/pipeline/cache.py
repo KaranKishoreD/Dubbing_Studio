@@ -28,6 +28,8 @@ def instruction_hash(instruction: str) -> str:
 
 
 def video_id_from_url(url: str) -> str:
+    if url.startswith("upload:"):  # a file uploaded in the studio: its own id
+        return url.split(":", 1)[1]
     patterns = [
         r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})",
         r"(?:embed/)([A-Za-z0-9_-]{11})",

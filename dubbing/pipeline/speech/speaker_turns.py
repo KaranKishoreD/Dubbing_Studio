@@ -11,7 +11,7 @@ Who spoke when: find speaker turns and split lines so each has one speaker.
     sub-second flickers are smoothed away, and a Whisper segment is split
     wherever the speaker changes.
 
-Used by nodes/diarize.py.
+Used by steps/diarize.py.
 """
 
 import os

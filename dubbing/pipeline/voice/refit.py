@@ -26,13 +26,19 @@ _GROW_BELOW = float(os.environ.get("GROW_BELOW_FILL", "0.8"))
 _GROW_MIN_SECS = float(os.environ.get("GROW_MIN_SECS", "1.5"))
 
 
-def refit_lengths(segments: list[Segment], audio_path: str | None, run, lang_code: str) -> str:
+def refit_lengths(
+    segments: list[Segment],
+    audio_path: str | None,
+    run,
+    lang_code: str,
+    only: set[int] | None = None,
+) -> str:
     """
     Rewrite-and-re-voice any line whose real audio would need more than
     MAX_STRETCH speed-up, up to _REFIT_ROUNDS times. Shortening the words is
     what keeps the voice at a natural pace; speeding it up is the last resort.
     """
-    from ..nodes.align import MAX_STRETCH, _audio_len, slot_seconds, trimmed_duration
+    from ..steps.align import MAX_STRETCH, _audio_len, slot_seconds, trimmed_duration
     from ..text.length_fit import condense_to_budget, expand_to_fill
     from ..voice import tts_rate
 
@@ -44,7 +50,14 @@ def refit_lengths(segments: list[Segment], audio_path: str | None, run, lang_cod
     for rnd in range(1, _REFIT_ROUNDS + 1):
         measured: list[tuple[Segment, float, float]] = []  # seg, clip secs, slot secs
         for i, seg in enumerate(ordered):
-            if seg.dubbed_audio and seg.dubbed_text:
+            # Lines in another language (an edit) are not rewritten here, nor
+            # lines this run did not voice (an edit leaves them as they are).
+            if (
+                seg.dubbed_audio
+                and seg.dubbed_text
+                and not seg.lang_override
+                and (only is None or seg.id in only)
+            ):
                 try:
                     measured.append(
                         (seg, trimmed_duration(seg.dubbed_audio), slot_seconds(ordered, i, total))

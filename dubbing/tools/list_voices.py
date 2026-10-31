@@ -1,6 +1,6 @@
 """
 Try every known Bodhan voice name to find which ones are valid.
-Run:  python list_voices.py
+Run from dubbing/:  python -m tools.list_voices
 """
 
 import json
@@ -10,7 +10,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv(Path(__file__).parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")  # project root
 
 client = OpenAI(
     base_url="https://api.bodhan.ai/v1",

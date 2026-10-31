@@ -34,6 +34,7 @@ import soundfile as sf
 ENABLED = os.environ.get("VOICE_CLONE", "1") == "1"
 _DIR = Path(__file__).resolve().parents[2] / "SeedVC"
 _PY = _DIR / ".venv-vc" / "bin" / "python"
+
 _WORKER = Path(__file__).resolve().parent / "seedvc_worker.py"
 _REF_SECS = 25.0  # Seed-VC uses at most 25 s of reference
 _MIN_ENV_CORR = 0.6  # measured 0.75–0.86 on good conversions
@@ -95,6 +96,18 @@ def references(segments, vocals_path: str, cache_dir: Path) -> dict[int, str]:
 _REF_VERSION = 2  # bump when reference selection changes
 _F0_RANGE = {"male": (80, 175), "female": (160, 300)}
 
+# Cloning may change a voice's timbre, never its gender. A line or a clone
+# whose median pitch crosses these limits belongs to someone else: a female
+# chorus under a man's line once turned his cloned voice female.
+_GENDER_LIMIT = {"male": (0, 200), "female": (130, 1000)}
+
+
+def _fits_gender(f0: float | None, gender: str | None) -> bool:
+    if not f0 or gender not in _GENDER_LIMIT:
+        return True
+    lo, hi = _GENDER_LIMIT[gender]
+    return lo <= f0 <= hi
+
 
 def _speaker_f0(segs) -> float | None:
     """Duration-weighted median line pitch, clamped to the gender's range."""
@@ -137,6 +150,14 @@ def _clean_chunks(y: np.ndarray, sr: int, target: float | None) -> list[np.ndarr
 
 _SAME_VOICE = float(os.environ.get("VC_SAME_VOICE_SIM", "0.6"))
 
+# VC_KEEP_INTONATION=1: clone with Seed-VC's pitch-following model, which
+# keeps the TTS line's own rise and fall (its emotion) and only moves it
+# into the speaker's range. The default speech model rebuilds intonation
+# largely from the speaker's reference, which flattens excited lines.
+KEEP_INTONATION = os.environ.get("VC_KEEP_INTONATION", "0") == "1"
+_MODE_TAG = "vc2f" if KEEP_INTONATION else "vc2"
+_MODE_ENV = {"SEEDVC_SINGING": "1", "SEEDVC_AUTO_F0": "1"} if KEEP_INTONATION else None
+
 
 def line_references(segments, vocals_path: str, cache_dir: Path) -> dict[int, str]:
     """
@@ -166,7 +187,11 @@ def line_references(segments, vocals_path: str, cache_dir: Path) -> dict[int, st
     ]
     if len(usable) < 2:
         return {}
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    from ..video.latentsync_runner import free_gpu_gb
+
+    # The voiceprint model is small; on a full GPU it runs on the CPU rather
+    # than failing, so results do not depend on what else is running.
+    dev = "cuda" if torch.cuda.is_available() and free_gpu_gb() >= 1.0 else "cpu"
     enc = EncoderClassifier.from_hparams(
         "speechbrain/spkrec-ecapa-voxceleb", run_opts={"device": dev}
     )
@@ -211,11 +236,25 @@ def line_references(segments, vocals_path: str, cache_dir: Path) -> dict[int, st
     return out
 
 
-def clone_lines(segments, vocals_path: str, cache_dir: Path, segs_dir: Path) -> tuple[dict, str]:
+def clone_lines(
+    segments,
+    vocals_path: str,
+    cache_dir: Path,
+    segs_dir: Path,
+    keep_voice: set | None = None,
+) -> tuple[dict, str]:
     """
     {segment id: cloned wav} for every dubbed line that converted well, plus a
     log note. Lines already converted for the same TTS clip and reference are
     reused from the cache.
+
+    Each line is first cloned against its own reference (line_references).
+    If that clone comes out the wrong gender (music or another voice under
+    the line), it is cloned once more against the speaker's reference; if
+    that fails too, the TTS voice is kept. Lines marked clone_ref="speaker"
+    (an edit asked for one steady voice) use only the speaker's reference.
+    Speakers in keep_voice were given a voice by the user: their lines keep
+    that voice, since cloning would turn it back into the original's.
     """
     refs = references(segments, vocals_path, cache_dir)
     try:
@@ -223,48 +262,89 @@ def clone_lines(segments, vocals_path: str, cache_dir: Path, segs_dir: Path) -> 
     except Exception as exc:
         print(f"  ⚠ per-line voice references skipped ({exc}) — speaker references used")
         by_line = {}
-    done, jobs = {}, []
+    done: dict[int, str] = {}
+    pending: list[tuple] = []  # (segment, job, references left to try)
+    counts = {"failed": 0, "rejected": 0, "retried": 0}
+
+    def plan(s, tries: list[str]) -> None:
+        """Use a cached clone, or queue a job, for the first reference that is not ruled out."""
+        while tries:
+            ref, tries = tries[0], tries[1:]
+            stem = os.path.splitext(os.path.basename(s.dubbed_audio))[0]
+            out = segs_dir / f"{stem}_{_MODE_TAG}_{Path(ref).stem.rsplit('_', 1)[-1]}.wav"
+            if (out.parent / (out.name + ".rejected")).exists():
+                return  # failed the quality check before: TTS kept
+            if (out.parent / (out.name + ".wronggender")).exists():
+                continue  # wrong gender before: try the next reference
+            if out.exists():
+                # Clones made before the gender check are checked once.
+                checked = out.parent / (out.name + f".{s.gender or 'any'}.ok")
+                if checked.exists() or _fits_gender(_median_f0(*_mono(out)), s.gender):
+                    checked.touch()
+                    done[s.id] = str(out)
+                    return
+                print(f"  ⚠ voice clone seg {s.id}: cached clone has the wrong gender")
+                os.replace(out, str(out) + ".wronggender")
+                continue
+            job = {
+                "source": _padded(s.dubbed_audio, segs_dir),
+                "target": str(Path(ref).resolve()),
+                "out": str(out.resolve()),
+            }
+            pending.append((s, job, tries))
+            return
+
     for s in segments:
-        ref = by_line.get(s.id) or refs.get(s.speaker or 0)
-        if not s.dubbed_audio or not ref or not os.path.exists(s.dubbed_audio):
+        if not s.dubbed_audio or not os.path.exists(s.dubbed_audio):
             continue
-        stem = os.path.splitext(os.path.basename(s.dubbed_audio))[0]
-        out = segs_dir / f"{stem}_vc2_{Path(ref).stem.rsplit('_', 1)[-1]}.wav"
-        if (out.parent / (out.name + ".rejected")).exists():
-            continue  # failed the check before
-        if out.exists():
-            done[s.id] = str(out)
-        else:
-            jobs.append(
-                (
-                    s,
-                    {
-                        "source": _padded(s.dubbed_audio, segs_dir),
-                        "target": str(Path(ref).resolve()),
-                        "out": str(out.resolve()),
-                    },
-                )
-            )
-    failed = rejected = 0
-    if jobs:
-        results = _run([j for _, j in jobs], cache_dir)
-        for s, j in jobs:
+        if keep_voice and (s.speaker or 0) in keep_voice and s.clone_ref != "speaker":
+            continue
+        cref = getattr(s, "clone_ref", None) or ""
+        if cref.startswith("file:"):  # the user's own recording for this speaker
+            mine = cache_dir / cref[5:]
+            tries = [str(mine)] if mine.exists() else []
+            plan(s, tries)
+            continue
+        own = None if cref == "speaker" else by_line.get(s.id)
+        tries = [r for r in (own, refs.get(s.speaker or 0)) if r]
+        plan(s, list(dict.fromkeys(tries)))
+
+    # Up to two rounds: own reference, then the speaker's for wrong-gender clones.
+    for _ in range(2):
+        if not pending:
+            break
+        batch, pending[:] = list(pending), []
+        results = _run([j for _, j, _ in batch], cache_dir, _MODE_ENV)
+        for s, j, tries in batch:
             r = results.get(j["out"], "worker crashed — see seedvc.log")
             if r != "ok" or not os.path.exists(j["out"]):
-                failed += 1
+                counts["failed"] += 1
                 print(f"  ⚠ voice clone seg {s.id}: {r}")
                 continue
-            if not _postprocess(j["source"], j["out"], _ref_f0(j["target"])):
-                rejected += 1
-                os.replace(j["out"], j["out"] + ".rejected")
-                continue
-            done[s.id] = j["out"]
+            problem = _postprocess(j["source"], j["out"], _ref_f0(j["target"]), s.gender)
+            if not problem:
+                done[s.id] = j["out"]
+            elif problem == "gender" and tries:
+                os.replace(j["out"], j["out"] + ".wronggender")
+                counts["retried"] += 1
+                plan(s, tries)
+            else:
+                counts["rejected"] += 1
+                os.replace(
+                    j["out"], j["out"] + (".wronggender" if problem == "gender" else ".rejected")
+                )
+
     note = (
         f"✓ Voices cloned to each original speaker (Seed-VC): {len(done)} line(s), "
         f"{len(refs)} speaker reference(s)"
     )
-    if failed or rejected:
-        note += f"; {failed + rejected} kept the TTS voice ({rejected} failed the quality check)"
+    if counts["retried"]:
+        note += f"; {counts['retried']} redone with the speaker's reference (wrong gender at first)"
+    if counts["failed"] or counts["rejected"]:
+        note += (
+            f"; {counts['failed'] + counts['rejected']} kept the TTS voice "
+            f"({counts['rejected']} failed the quality check)"
+        )
     return done, note
 
 
@@ -293,6 +373,11 @@ def _median_f0(y: np.ndarray, sr: int) -> float | None:
     return float(np.median(f)) if len(f) >= 10 else None
 
 
+def _mono(path) -> tuple[np.ndarray, int]:
+    y, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    return y.mean(axis=1), sr
+
+
 _REF_F0: dict[str, float | None] = {}
 
 
@@ -304,8 +389,13 @@ def _ref_f0(ref_path: str) -> float | None:
     return _REF_F0[ref_path]
 
 
-def _postprocess(tts_path: str, out_path: str, speaker_f0: float | None = None) -> bool:
-    """Back to the TTS sample rate and level; False if the conversion is unusable."""
+def _postprocess(
+    tts_path: str, out_path: str, speaker_f0: float | None = None, gender: str | None = None
+) -> str:
+    """
+    Back to the TTS sample rate and level. Returns "" when the clone is
+    usable, otherwise why not: "length", "timing", "pitch" or "gender".
+    """
     import librosa
 
     y, sr = sf.read(tts_path, dtype="float32", always_2d=True)
@@ -315,17 +405,19 @@ def _postprocess(tts_path: str, out_path: str, speaker_f0: float | None = None) 
     if zsr != sr:
         z = librosa.resample(z, orig_sr=zsr, target_sr=sr)
     if abs(len(z) - len(y)) > 0.02 * len(y) + 0.05 * sr:
-        return False
+        return "length"
     z = z[: len(y)] if len(z) >= len(y) else np.pad(z, (0, len(y) - len(z)))
     if _env_corr(y, z, sr) < _MIN_ENV_CORR:
-        return False
+        return "timing"
     # Seed-VC is unstable on very short lines and can land far above or below
     # the speaker's pitch. Such a clone is discarded and the TTS line kept.
-    if speaker_f0:
-        f = _median_f0(z, sr)
-        if f and abs(12 * np.log2(f / speaker_f0)) > _MAX_F0_OFF_ST:
-            print(f"  ⚠ clone off pitch ({f:.0f} Hz vs speaker {speaker_f0:.0f} Hz) — TTS kept")
-            return False
+    f = _median_f0(z, sr) if (speaker_f0 or gender) else None
+    if speaker_f0 and f and abs(12 * np.log2(f / speaker_f0)) > _MAX_F0_OFF_ST:
+        print(f"  ⚠ clone off pitch ({f:.0f} Hz vs speaker {speaker_f0:.0f} Hz)")
+        return "pitch"
+    if not _fits_gender(f, gender):
+        print(f"  ⚠ clone at {f:.0f} Hz does not fit a {gender} speaker")
+        return "gender"
     g = np.sqrt(np.mean(y**2) + 1e-12) / np.sqrt(np.mean(z**2) + 1e-12)
     z = z * min(g, 4.0)
     peak = float(np.max(np.abs(z))) if len(z) else 0.0
@@ -341,7 +433,7 @@ def _postprocess(tts_path: str, out_path: str, speaker_f0: float | None = None) 
     if f > 0:
         z[-f:] *= np.linspace(1.0, 0.0, f, dtype=np.float32)
     sf.write(out_path, z.astype(np.float32), sr)
-    return True
+    return ""
 
 
 def _env_corr(a: np.ndarray, b: np.ndarray, sr: int) -> float:

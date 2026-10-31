@@ -1,5 +1,6 @@
 """
-Which shots of each line get lip-synced.
+Which shots of each line get lip-synced: the older, screen-time method, now
+used only when smart lip sync (smart_sync.py) cannot score the faces.
 
 A line is cut into shots at camera cuts. A shot is synced only if the
 speaker's own face is on screen, turned at most ~40°, and actually moving

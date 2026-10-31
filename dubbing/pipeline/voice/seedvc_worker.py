@@ -34,7 +34,9 @@ def main(jobs_path: str, results_path: str) -> None:
         # SEEDVC_SINGING=1: the f0-conditioned 44 kHz singing model, which keeps
         # the source melody exactly (song mode); else the speech model.
         f0_condition=os.environ.get("SEEDVC_SINGING") == "1",
-        auto_f0_adjust=False,
+        # SEEDVC_AUTO_F0=1 (with the f0 model): move the source pitch into the
+        # reference speaker's range, keeping its contour.
+        auto_f0_adjust=os.environ.get("SEEDVC_AUTO_F0") == "1",
         semi_tone_shift=0,
         length_adjust=1.0,
         diffusion_steps=int(os.environ.get("SEEDVC_STEPS", "30")),

@@ -6,7 +6,6 @@ Lines with a tone edit ("make it funny") go to the LLM instead, which can
 follow a style instruction.
 """
 
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
@@ -59,10 +58,9 @@ Return ONLY valid JSON (no markdown):
 
 
 def bodhan_client() -> OpenAI:
-    return OpenAI(
-        base_url="https://api.bodhan.ai/v1",
-        api_key=os.environ["BODHAN_TRANSLATE_KEY"],
-    )
+    from ..bodhan_gate import bodhan_client as gated_client
+
+    return gated_client("BODHAN_TRANSLATE_KEY")
 
 
 def needs_style_llm(instruction: str) -> bool:
@@ -77,26 +75,17 @@ def translate_with_bodhan(
     client = bodhan_client()
 
     def _translate_one(seg: Segment) -> tuple[int, str]:
-        import time
+        from ..bodhan_gate import TRANSLATE
 
-        # A rate-limit reply is waited out; otherwise the line would fall
-        # back to the paid LLM.
-        waits = [2, 4, 8, 16, 30]
-        for attempt in range(len(waits) + 1):
-            try:
-                resp = client.chat.completions.create(
-                    model="indic-translate",
-                    messages=[{"role": "user", "content": seg.text}],
-                    extra_body={
-                        "target_language_code": target_lang,
-                        "target_script": "native",
-                    },
-                )
-                return seg.id, resp.choices[0].message.content.strip()
-            except Exception as exc:
-                if "429" not in str(exc) or attempt == len(waits):
-                    raise
-                time.sleep(waits[attempt])
+        # Through the shared translate gate: a rate-limit reply is waited
+        # out; otherwise the line would fall back to the paid LLM.
+        resp = TRANSLATE.call(
+            client.chat.completions.create,
+            model="indic-translate",
+            messages=[{"role": "user", "content": seg.text}],
+            extra_body={"target_language_code": target_lang, "target_script": "native"},
+        )
+        return seg.id, resp.choices[0].message.content.strip()
 
     failed: list[Segment] = []
     with ThreadPoolExecutor(max_workers=min(len(group), 10)) as pool:

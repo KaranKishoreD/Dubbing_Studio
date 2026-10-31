@@ -12,7 +12,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from .catalogue import SARVAM_MODEL, SARVAM_TTS_LANGS, is_sarvam
+from .catalogue import SARVAM_MODEL, SARVAM_TTS_LANGS, is_kokoro, is_sarvam, kokoro_lang
 
 
 def sarvam_tts(text: str, lang_code: str, voice: str) -> bytes:
@@ -50,29 +50,61 @@ def sarvam_tts(text: str, lang_code: str, voice: str) -> bytes:
 
 def bodhan_tts(client, text: str, lang_code: str, voice: str, style: str) -> bytes:
     """
-    WAV bytes from Bodhan indic-speak. A rate-limit reply (429) is waited
-    out and retried (2, 4, 8, 16, 30 s) instead of leaving the line
+    WAV bytes from Bodhan indic-speak, through the shared speak gate
+    (pipeline/bodhan_gate.py): limited parallel calls, and a rate-limit
+    reply pauses every caller and is retried instead of leaving the line
     undubbed.
     """
-    import time
+    from ..bodhan_gate import SPEAK
 
-    waits = [2, 4, 8, 16, 30]
-    for attempt in range(len(waits) + 1):
-        try:
-            return client.audio.speech.create(
+    return SPEAK.call(
+        lambda: (
+            client.audio.speech.create(
                 model="indic-speak",
                 input=text,
                 voice=voice,
                 extra_body={"instructions": json.dumps({"lang": lang_code, "style": style})},
             ).content
-        except Exception as exc:
-            if "429" not in str(exc) or attempt == len(waits):
-                raise
-            print(f"  … Bodhan rate limit — retrying in {waits[attempt]}s")
-            time.sleep(waits[attempt])
+        )
+    )
+
+
+_KOKORO_PIPES: dict = {}
+_KOKORO_LOCK = __import__("threading").Lock()
+
+
+def kokoro_tts(text: str, lang_code: str, voice: str) -> bytes:
+    """WAV bytes (24 kHz) from Kokoro-82M, on the GPU if free. One pipeline
+    per language, shared; calls are serialised (the model is small and fast,
+    and one GPU model is not safe to call from several threads at once)."""
+    import io
+
+    import numpy as np
+    import soundfile as sf
+
+    with _KOKORO_LOCK:
+        code = kokoro_lang(lang_code)
+        if code not in _KOKORO_PIPES:
+            from kokoro import KPipeline
+
+            _KOKORO_PIPES[code] = KPipeline(lang_code=code, repo_id="hexgrad/Kokoro-82M")
+        parts = [
+            np.asarray(a) for _, _, a in _KOKORO_PIPES[code](text, voice=voice.split(":", 1)[1])
+        ]
+    if not parts:
+        raise RuntimeError("Kokoro produced no audio")
+    buf = io.BytesIO()
+    sf.write(buf, np.concatenate(parts), 24000, format="WAV")
+    return buf.getvalue()
 
 
 def tts_bytes(text: str, lang_code: str, voice: str, style: str, client=None) -> bytes:
+    if is_kokoro(voice):
+        return kokoro_tts(text, lang_code, voice)
+    if voice.startswith("piper:"):
+        from .piper_voices import tts as piper_tts
+
+        return piper_tts(text, voice)
     if is_sarvam(voice):
         return sarvam_tts(text, lang_code, voice)
     return bodhan_tts(client or bodhan_speak_client(), text, lang_code, voice, style)
@@ -90,10 +122,9 @@ def preview_voice(voice: str, lang_code: str, text: str, out_path: Path) -> str:
 
 
 def bodhan_speak_client() -> OpenAI:
-    return OpenAI(
-        base_url="https://api.bodhan.ai/v1",
-        api_key=os.environ["BODHAN_SPEAK_KEY"],
-    )
+    from ..bodhan_gate import bodhan_client
+
+    return bodhan_client("BODHAN_SPEAK_KEY")
 
 
 def speakable(text: str) -> str:

@@ -340,7 +340,7 @@ def _clarity(y: np.ndarray, sr: int, lyric: str, lang_code: str) -> float:
 
     import librosa
 
-    from ..nodes.transcribe import _whisper
+    from ..steps.transcribe import _whisper
 
     y16 = librosa.resample(y, orig_sr=sr, target_sr=16000)
     heard = "".join(
@@ -528,7 +528,7 @@ def _fit(voc: Path, seg, work: Path, lang_code: str) -> np.ndarray | None:
     import librosa
     import pyrubberband as pyrb
 
-    from ..nodes.transcribe import _whisper
+    from ..steps.transcribe import _whisper
 
     SR = 44100
     y, _ = librosa.load(str(voc), sr=SR, mono=True)

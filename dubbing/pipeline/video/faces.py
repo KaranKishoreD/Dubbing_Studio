@@ -92,8 +92,22 @@ def talking_faces(segments, a: dict) -> dict[int, int]:
     return out
 
 
-def split_speakers(segments, video_path: str, cache_dir: Path) -> str:
-    """Give extra talking faces of one diarized speaker their own speaker id."""
+# Voice similarity (ECAPA, cosine of line-group centres) at or above which a
+# second face of one diarized speaker is taken to be the same person seen on
+# another camera shot, not a new character. Measured on a film scene (3
+# Idiots, three men): the same actor across shots 0.51–0.64, different
+# people 0.00–0.22.
+SAME_VOICE = float(os.environ.get("FACE_SPLIT_SAME_VOICE", "0.35"))
+
+
+def split_speakers(segments, video_path: str, cache_dir: Path, voice_sim=None) -> str:
+    """
+    Give extra talking faces of one diarized speaker their own speaker id,
+    but only when the voice agrees. In films the camera often shows the
+    listener, or the same actor from another angle, so a second face alone
+    is weak evidence. voice_sim(ids_a, ids_b) → cosine similarity of the two
+    groups of lines' voices; a split is skipped when it is ≥ SAME_VOICE.
+    """
     if not ENABLED or not video_path or not os.path.exists(video_path):
         return ""
     a = analysis(video_path, cache_dir)
@@ -113,7 +127,7 @@ def split_speakers(segments, video_path: str, cache_dir: Path) -> str:
     # new speakers (one id per face, even across diarized speakers).
     next_id = max(speakers) + 1
     new_id: dict[int, int] = {}
-    moved = 0
+    moved = kept = 0
     for spk in sorted(speakers):
         mine: dict[int, float] = {}
         for s in segments:
@@ -123,18 +137,36 @@ def split_speakers(segments, video_path: str, cache_dir: Path) -> str:
         if len(mine) < 2:
             continue
         main = max(mine, key=mine.get)
+        main_ids = [s.id for s in segments if s.speaker == spk and face_of.get(s.id) == main]
+        same_voice = set()
+        if voice_sim is not None:
+            for f in mine:
+                if f == main:
+                    continue
+                f_ids = [s.id for s in segments if s.speaker == spk and face_of.get(s.id) == f]
+                try:
+                    if voice_sim(f_ids, main_ids) >= SAME_VOICE:
+                        same_voice.add(f)
+                        kept += len(f_ids)
+                except Exception as exc:
+                    print(f"  ⚠ voice check for a face split failed: {exc}")
         for s in segments:
             f = face_of.get(s.id)
-            if s.speaker == spk and f in faces and f != main:
+            if s.speaker == spk and f in faces and f != main and f not in same_voice:
                 if f not in new_id:
                     new_id[f], next_id = next_id, next_id + 1
                 s.speaker = new_id[f]
                 moved += 1
+    note = (
+        f"  faces: {kept} line(s) on another camera shot kept with their speaker (same voice)"
+        if kept
+        else ""
+    )
     if not moved:
-        return ""
+        return note
     return (
         f"✓ Speakers from faces: {len(faces)} talking faces vs {len(speakers)} voices — "
-        f"{moved} line(s) moved to {len(new_id)} new speaker(s)"
+        f"{moved} line(s) moved to {len(new_id)} new speaker(s)" + (f"\n{note}" if note else "")
     )
 
 

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 1400" width="1440" height="1400">
+  <!-- One tile of the page background, repeated down the page: abstract
+       Indian shapes on the peacock teal. Nothing crosses the top or bottom
+       edge, so the tiles join without a seam. -->
+  <circle cx="90" cy="230" r="210" fill="#f2a516" opacity=".22"/>
+  <circle cx="90" cy="230" r="140" fill="none" stroke="#ffd36b" stroke-width="2" stroke-dasharray="2 10" opacity=".55"/>
+  <g transform="translate(1210 260)" fill="none" stroke="#ffffff" opacity=".14">
+    <circle r="70" stroke-width="2"/><circle r="110" stroke-width="1.5" stroke-dasharray="4 8"/><circle r="150" stroke-width="2"/>
+    <circle r="185" stroke-width="1" stroke-dasharray="1 9"/>
+    <path d="M0 -150 L18 -110 L0 -70 L-18 -110Z M150 0 L110 18 L70 0 L110 -18Z M0 150 L-18 110 L0 70 L18 110Z M-150 0 L-110 -18 L-70 0 L-110 18Z" stroke-width="1.5"/>
+  </g>
+  <path d="M-20 640 C260 560 380 760 700 700 S1180 560 1460 660 L1460 740 C1180 650 980 810 700 790 S240 690 -20 730Z" fill="#173f9c" opacity=".30"/>
+  <g transform="translate(1260 1010) rotate(-25) scale(2.1)" opacity=".32">
+    <path d="M0 0 C60 -90 170 -50 150 40 C132 118 40 128 -6 86 C-40 54 -26 18 0 0Z" fill="#d1235f"/>
+    <path d="M52 32 C70 6 100 14 98 38 C96 60 70 66 58 52" fill="none" stroke="#ffd36b" stroke-width="3"/>
+  </g>
+  <path d="M110 1330 L110 1010 Q110 880 240 830 Q370 880 370 1010 L370 1330" fill="none" stroke="#f2a516" stroke-width="3" opacity=".32"/>
+  <path d="M150 1330 L150 1025 Q150 920 240 880 Q330 920 330 1025 L330 1330" fill="none" stroke="#f2a516" stroke-width="1.5" opacity=".22"/>
+  <circle cx="760" cy="1180" r="170" fill="#0b8a7a" opacity=".35"/>
+  <circle cx="760" cy="1180" r="120" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-dasharray="3 9" opacity=".25"/>
+  <path d="M-20 420 Q 120 380 240 440 T 480 430" fill="none" stroke="#ffd36b" stroke-width="2" opacity=".3"/>
+  <path d="M960 1300 Q 1080 1250 1200 1300 T 1460 1290" fill="none" stroke="#ffd36b" stroke-width="2" opacity=".28"/>
+  <g fill="#ffd36b" opacity=".5">
+    <path d="M620 120 l8 8 -8 8 -8 -8z"/><path d="M880 70 l6 6 -6 6 -6 -6z"/><path d="M960 420 l7 7 -7 7 -7 -7z"/>
+    <path d="M520 480 l6 6 -6 6 -6 -6z"/><path d="M1360 520 l8 8 -8 8 -8 -8z"/><path d="M560 960 l7 7 -7 7 -7 -7z"/>
+    <path d="M1040 880 l6 6 -6 6 -6 -6z"/><path d="M420 1260 l7 7 -7 7 -7 -7z"/><path d="M1380 1200 l6 6 -6 6 -6 -6z"/>
+  </g>
+</svg>

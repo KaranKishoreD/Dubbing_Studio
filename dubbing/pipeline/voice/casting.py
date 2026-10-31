@@ -15,11 +15,17 @@ from .catalogue import (
     _LANG_ALIAS,
     _MALE_VOICES,
     ALL_VOICES,
+    INTERNATIONAL_ONLY,
+    KOKORO_LANGS,
     SARVAM_TTS_LANGS,
     SARVAM_VOICES,
+    kokoro_pool,
     sarvam_gender,
     voice_catalogue,
     voice_profiles,
+)
+from .catalogue import (
+    kokoro_gender as gender_of,
 )
 
 # ── Per-speaker casting ───────────────────────────────────────────────────────
@@ -59,6 +65,23 @@ def _voice_pool(lang_code: str, gender: str, backend: str = "bodhan") -> list[st
     Sarvam voices are not tied to a language; they are ordered by measured
     pitch from the middle out, so the first picks sound typical, not extreme.
     """
+    # International mode (backend "kokoro" = open voices): Kokoro where it
+    # has the language and gender, Piper for every other language (and for
+    # French men: Kokoro's only French voice is female).
+    if backend == "kokoro" or lang_code in INTERNATIONAL_ONLY:
+        if lang_code in KOKORO_LANGS:
+            k = kokoro_pool(lang_code, gender)
+            if any(gender_of(v) == gender for v in k):
+                return k
+        from .piper_voices import languages as piper_langs
+        from .piper_voices import pool as piper_pool
+
+        if lang_code in piper_langs():
+            return piper_pool(lang_code, gender) + (
+                kokoro_pool(lang_code, gender) if lang_code in KOKORO_LANGS else []
+            )
+        if lang_code in KOKORO_LANGS:
+            return kokoro_pool(lang_code, gender)
     if backend == "sarvam" and lang_code in SARVAM_TTS_LANGS:
         prof = voice_profiles()
         vs = [v for v in SARVAM_VOICES if sarvam_gender(v) == gender]

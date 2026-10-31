@@ -36,8 +36,8 @@ def time_budgets(ordered: list[Segment], target_lang: str) -> dict[int, tuple[fl
     up to the next line, borrowing trailing silence — and characters come from
     the voice's measured speaking rate in this language.
     """
-    from ..nodes.align import slot_seconds
     from ..speech.pace import speaker_factors
+    from ..steps.align import slot_seconds
     from ..voice.tts_rate import chars_per_sec
 
     cps = chars_per_sec(target_lang.split("-")[0])

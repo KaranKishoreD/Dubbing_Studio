@@ -50,19 +50,32 @@ _SPEAKER_STYLE: dict[int, str] = {}
 def line_style(seg: Segment, global_style: str) -> str:
     """
     Global style, or in auto mode the speaker's own style (matched to their
-    tempo). Only clearly energetic lines get a style of their own: switching
-    styles line by line made one person's voice change mid-conversation.
+    tempo). Only lines with a clear feeling get a style of their own
+    (voice/emotion.py): switching styles line by line made one person's
+    voice change mid-conversation.
     """
+    from .emotion import STYLE_OF
+
     if seg.style_override:  # set by an edit ("make line 5 sad")
         return seg.style_override
     if global_style != "auto":
         return global_style
     base = _SPEAKER_STYLE.get(seg.speaker if seg.speaker is not None else 0, AUTO_BASE_STYLE)
+    if seg.emotion is not None:  # labelled: the emotion pass decided
+        return STYLE_OF.get(seg.emotion, base)
     return "happy" if seg.delivery == "energetic" else base
 
 
-def pick_speaker_styles(segments: list[Segment], lang_code: str, global_style: str) -> str:
-    """Auto mode: each speaker's style = the one closest to their tempo."""
+# News styles read plain talk like a bulletin: not used as the base voice of
+# an interview, chat or pitch.
+_NEWS_STYLES = {"news", "TV style news", "AIR style news"}
+
+
+def pick_speaker_styles(
+    segments: list[Segment], lang_code: str, global_style: str, genre: str = ""
+) -> str:
+    """Auto mode: each speaker's style = the one closest to their tempo
+    (news styles only for news)."""
     from ..speech import pace
 
     _SPEAKER_STYLE.clear()
@@ -72,7 +85,11 @@ def pick_speaker_styles(segments: list[Segment], lang_code: str, global_style: s
     picked = []
     for spk, factor in sorted(factors.items()):
         mine = [s for s in segments if (s.speaker or 0) == spk and s.dubbed_text and s.voice]
-        if not mine or is_sarvam(mine[0].voice) or str(mine[0].voice).startswith("gptaudio:"):
+        if (
+            not mine
+            or is_sarvam(mine[0].voice)
+            or str(mine[0].voice).startswith(("kokoro:", "piper:"))
+        ):
             continue
         sample = max((s.dubbed_text for s in mine), key=len)[:160]
         try:
@@ -85,6 +102,8 @@ def pick_speaker_styles(segments: list[Segment], lang_code: str, global_style: s
         except Exception as exc:
             print(f"  ⚠ style speeds not measured: {exc}")
             rates = {}
+        if genre and genre != "news":
+            rates = {k: v for k, v in rates.items() if k not in _NEWS_STYLES}
         style = pace.pick_style(factor, rates, AUTO_BASE_STYLE)
         _SPEAKER_STYLE[spk] = style
         picked.append(f"S{spk + 1} {factor:.2f}× → {style}")

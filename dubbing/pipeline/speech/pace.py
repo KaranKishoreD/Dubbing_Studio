@@ -104,7 +104,7 @@ def measure_styles(voice: str, lang_code: str, sample: str, tts) -> dict[str, fl
 
     import soundfile as sf
 
-    from ..nodes.align import _load_trimmed
+    from ..steps.align import _load_trimmed
 
     rates = style_rates()
     out = {}
@@ -131,6 +131,30 @@ def measure_styles(voice: str, lang_code: str, sample: str, tts) -> dict[str, fl
     _RATES_PATH.parent.mkdir(parents=True, exist_ok=True)
     _RATES_PATH.write_text(json.dumps(rates, ensure_ascii=False, indent=1), encoding="utf-8")
     return out
+
+
+# For a speed request without measurements for the voice: fastest first.
+_FAST_ORDER = ("TV style news", "news", "advertisements", "Customer Care")
+_SLOW_ORDER = ("educational lecture", "single person narration audiobook", "Customer Care")
+
+
+def style_for_speed(lang_code: str, voice: str | None, want: str) -> str | None:
+    """
+    The pace style that makes this voice speak fastest ("fast") or slowest
+    ("slow"), from its measured speeds (cache/_style_rates.json); None for
+    "normal" (back to the speaker's own style).
+    """
+    if want not in ("fast", "slow"):
+        return None
+    rates = style_rates()
+    mine = {
+        s: rates[f"{lang_code}|{voice}|{s}"]
+        for s in PACE_STYLES
+        if f"{lang_code}|{voice}|{s}" in rates
+    }
+    if len(mine) >= 2:
+        return (max if want == "fast" else min)(mine, key=mine.get)
+    return (_FAST_ORDER if want == "fast" else _SLOW_ORDER)[0]
 
 
 def pick_style(factor: float, rates: dict[str, float], default: str) -> str:

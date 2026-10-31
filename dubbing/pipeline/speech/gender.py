@@ -7,7 +7,7 @@ Speaker gender, used to cast a matching voice.
     a speaker's lines (the default; see GENDER_METHOD).
   - assign_genders: the pitch-only fallback.
 
-nodes/diarize.py then lets face analysis overrule these when faces are clear.
+steps/diarize.py then lets face analysis overrule these when faces are clear.
 """
 
 import os

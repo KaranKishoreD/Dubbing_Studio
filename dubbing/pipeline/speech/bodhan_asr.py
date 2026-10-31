@@ -44,11 +44,10 @@ def retranscribe(
     segments: list[Segment], audio: np.ndarray, cache_dir: Path, language: str | None
 ) -> tuple[int, int]:
     """Replace seg.text in place. Returns (replaced, failed)."""
-    from openai import OpenAI
 
-    client = OpenAI(
-        base_url="https://api.bodhan.ai/v1", api_key=os.environ["BODHAN_TRANSCRIBE_KEY"], timeout=60
-    )
+    from ..bodhan_gate import bodhan_client
+
+    client = bodhan_client("BODHAN_TRANSCRIBE_KEY", timeout=60)
     cache_file = cache_dir / "bodhan_asr.json"
     try:
         cache = json.loads(cache_file.read_text(encoding="utf-8"))
@@ -96,20 +95,17 @@ def retranscribe(
 _WORKERS = int(os.environ.get("BODHAN_ASR_WORKERS", "3"))
 
 
-def _call(client, chunk: np.ndarray, language: str | None, attempts: int = 5) -> str:
-    import time
+def _call(client, chunk: np.ndarray, language: str | None) -> str:
+    """One clip through the shared transcribe gate (pipeline/bodhan_gate.py)."""
+    from ..bodhan_gate import TRANSCRIBE
 
-    for k in range(attempts):
-        buf = io.BytesIO()
+    def once() -> str:
+        buf = io.BytesIO()  # a fresh file each try: a retry must resend it
         sf.write(buf, chunk, _SR, format="WAV", subtype="PCM_16")
         buf.seek(0)
         kwargs = {"model": "indic-transcribe", "file": ("line.wav", buf, "audio/wav")}
         if language:
             kwargs["language"] = language
-        try:
-            return client.audio.transcriptions.create(**kwargs).text.strip()
-        except Exception as exc:
-            if "429" not in str(exc) or k == attempts - 1:
-                raise
-            time.sleep(1.5 * (2**k))  # 1.5, 3, 6, 12 s
-    return ""
+        return client.audio.transcriptions.create(**kwargs).text.strip()
+
+    return TRANSCRIBE.call(once)

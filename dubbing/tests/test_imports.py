@@ -13,8 +13,8 @@ import pkgutil
 import pipeline
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-# Run inside their own virtual environments (LatentSync / Seed-VC).
-_EXTERNAL_WORKERS = ("latentsync_worker", "seedvc_worker")
+# Run inside their own virtual environments (LatentSync, Seed-VC, NeMo).
+_EXTERNAL_WORKERS = ("latentsync_worker", "seedvc_worker", "syncnet_worker")
 
 
 def test_every_module_imports():
@@ -26,7 +26,11 @@ def test_every_module_imports():
 
 def test_every_pipeline_import_resolves():
     problems = []
-    for path in list((ROOT / "pipeline").rglob("*.py")) + list((ROOT / "ui").glob("*.py")):
+    files = [
+        *(ROOT / "pipeline").rglob("*.py"),
+        *(ROOT / "server").glob("*.py"),
+    ]
+    for path in files:
         if path.stem in _EXTERNAL_WORKERS:
             continue
         package = ".".join(path.relative_to(ROOT).parent.parts)
@@ -37,7 +41,7 @@ def test_every_pipeline_import_resolves():
                 parts = package.split(".")
                 target = ".".join(parts[: len(parts) - node.level + 1])
                 target += f".{node.module}" if node.module else ""
-            elif node.module and node.module.startswith("pipeline"):
+            elif node.module and node.module.split(".")[0] in ("pipeline", "server"):
                 target = node.module
             else:
                 continue

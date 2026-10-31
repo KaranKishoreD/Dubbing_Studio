@@ -97,7 +97,9 @@ def video_context(state) -> str:
         return ""
 
 
-def direct_dub(segments: list[Segment], target_lang: str, context: str = "") -> int:
+def direct_dub(
+    segments: list[Segment], target_lang: str, context: str = "", only: set[int] | None = None
+) -> int:
     """
     One batched pass over the whole dialogue: gender agreement, colloquial
     register, consistent address, and length within each line's time
@@ -106,8 +108,10 @@ def direct_dub(segments: list[Segment], target_lang: str, context: str = "") -> 
     """
     if not os.environ.get("OPENROUTER_API_KEY"):
         return 0, 0
+    # Lines an edit put in another language keep their own translation.
     ordered = sorted(
-        [s for s in segments if s.dubbed_text and not s.keep_original], key=lambda s: s.start
+        [s for s in segments if s.dubbed_text and not s.keep_original and not s.lang_override],
+        key=lambda s: s.start,
     )
     if not ordered:
         return 0, 0
@@ -144,7 +148,9 @@ def direct_dub(segments: list[Segment], target_lang: str, context: str = "") -> 
     except Exception as exc:
         print(f"  ⚠ dubbing-director pass skipped: {exc}")
         return 0, 0
-    seg_map = {s.id: s for s in ordered}
+    # Every line is sent as context, but only `only` (the lines translated
+    # in this run) may change: an edit must not reword lines nobody touched.
+    seg_map = {s.id: s for s in ordered if only is None or s.id in only}
     changed = split = 0
     for it in items:
         if not isinstance(it, dict) or it.get("id") not in seg_map:

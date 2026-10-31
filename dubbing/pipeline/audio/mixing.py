@@ -1,5 +1,5 @@
 """
-Audio helpers for the final mix (used by nodes/assemble.py).
+Audio helpers for the final mix (used by steps/assemble.py).
 
   - read_stereo / read_mono / fit_length: load audio at a given sample rate.
   - balance_dialogue: keep each dubbed line as audible over the music as the

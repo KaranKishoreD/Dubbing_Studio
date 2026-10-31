@@ -48,6 +48,19 @@ class Segment:
     # Bodhan style that overrides the measured delivery for this line.
     keep_original: bool = False
     style_override: Optional[str] = None
+    # Set by edits: "speaker" = clone this line from the speaker's own
+    # reference only, so all their lines share one steady voice.
+    clone_ref: Optional[str] = None
+    # Set by edits: dub this line in another language than the rest
+    # (a language code, e.g. "bn").
+    lang_override: Optional[str] = None
+    # Set by voice/emotion.py: the feeling this line is voiced with
+    # ("neutral", "excited", "surprised", ...). None = not labelled yet.
+    emotion: Optional[str] = None
+    # False = this line's current audio has not been lip-synced (it was made
+    # in fast mode); True = the lip-sync stage has processed it. None = made
+    # before this was recorded.
+    synced: Optional[bool] = None
     # Transcript provenance: "gap" = recovered from speech Whisper skipped,
     # "low" = refine step is unsure. asr_raw = the text before refinement.
     asr_flag: Optional[str] = None
@@ -82,6 +95,10 @@ class Segment:
         "sync_clips",
         "keep_original",
         "style_override",
+        "clone_ref",
+        "lang_override",
+        "emotion",
+        "synced",
         "asr_flag",
         "asr_raw",
         "sung",
@@ -99,16 +116,6 @@ class Segment:
     @classmethod
     def from_dict(cls, d: dict) -> "Segment":
         return cls(**{k: v for k, v in d.items() if k in cls._FIELDS})
-
-    def clear_downstream(self, from_stage: str) -> None:
-        """Clear cached outputs from a given stage onward so they get recomputed."""
-        order = ["dubbed_text", "dubbed_audio", "aligned_audio", "lip_synced_clip"]
-        clearing = False
-        for attr in order:
-            if attr == from_stage:
-                clearing = True
-            if clearing:
-                setattr(self, attr, None)
 
 
 class PipelineState(TypedDict):
@@ -135,6 +142,14 @@ class PipelineState(TypedDict):
     speaker_profiles: dict
     # Known speaker count from the UI; None = detect automatically
     num_speakers: Optional[int]
+    # Fast mode: False = do not render lip sync (only reuse finished shots).
+    lipsync: Optional[bool]
+    # Set by align: lines whose audio is new in this run (the only lines
+    # lip sync renders). None = not known, e.g. an "Add lip sync" job.
+    new_audio: Optional[List[int]]
+    # lines whose lip sync is rendered again even though their audio is
+    # unchanged (a "lip_sync" edit)
+    resync_ids: Optional[List[int]]
     # Per-speaker voice chosen in the UI: {"0": "Kavya", ...}. Speakers not
     # listed are cast automatically.
     voice_map: dict
@@ -143,6 +158,9 @@ class PipelineState(TypedDict):
     # "indic": Bodhan translates every line, the LLM only the lines it fails;
     # "llm": the LLM translates the whole dialogue.
     translator: Optional[str]
+    # "indic" (Bodhan/Sarvam, the 22 Indian languages) or "international"
+    # (LLM translation, Kokoro voices: English and six world languages)
+    mode: Optional[str]
     # Sung lyrics: "resing" (song mode, re-sung in the dub language) or
     # "keep" (left as the original singing).
     songs: Optional[str]

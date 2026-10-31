@@ -5,7 +5,7 @@ Older lip-sync backends, kept selectable through LIPSYNC_BACKEND.
            needs a Wav2Lip checkout and wav2lip_gan.pth)
   fal      fal.ai cloud "video-retalking" (FAL_KEY + FAL_ENABLED=1)
 
-LatentSync (nodes/lipsync.py) is the default and gives much better results.
+LatentSync (steps/lipsync.py) is the default and gives much better results.
 """
 
 import json

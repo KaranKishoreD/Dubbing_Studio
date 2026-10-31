@@ -1,6 +1,6 @@
 """
 Put the lip-synced shots back into the original video (used by
-nodes/assemble.py).
+steps/assemble.py).
 
 Each lip-synced clip is laid over the original video only for its own time
 span, so everything else stays the untouched original frames. LatentSync
