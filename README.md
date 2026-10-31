@@ -1,6 +1,6 @@
 # Dubbing Studio
 
-![Dubbing Studio Interface](../images/hero.png)
+![Dubbing Studio Interface](./hero.png)
 
 **Make any video speak in Indian languages.** Paste a link, and get it back dubbed with lip-sync, natural voices, and a single-click edit workflow.
 
