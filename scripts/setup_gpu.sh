@@ -40,6 +40,7 @@ python -m pip install --upgrade pip wheel
 
 echo "▶ Installing base requirements"
 pip install -r dubbing/requirements.txt
+python -m unidic download   # Japanese dictionary for International mode (~500 MB)
 
 echo "▶ Installing GPU requirements (CUDA 12.8 / torch>=2.7 for Blackwell)"
 pip install -r dubbing/requirements-gpu.txt
@@ -174,6 +175,6 @@ Next:
        https://huggingface.co/pyannote/segmentation-3.0
   3. Run:
        source .venv/bin/activate
-       cd dubbing && python -m ui.app
+       cd dubbing && python -m server      # then open http://127.0.0.1:8000
 ─────────────────────────────────────────────────────────────
 EOF

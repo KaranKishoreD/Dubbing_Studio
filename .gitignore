@@ -42,7 +42,6 @@ dubbing/Separator/
 # ── Pipeline artifacts & media ────────────────────────────────────────────────
 dubbing/cache/
 dubbing/compare/
-dubbing/.gradio/
 data/
 outputs/
 *.mp4
@@ -73,3 +72,8 @@ desktop.ini
 .claude/settings.local.json
 logs/
 backups/
+dubbing/web/compare/
+dubbing/voices/
+
+dubbing/cache_archive/
+.gradio/

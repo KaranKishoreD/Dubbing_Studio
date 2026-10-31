@@ -1,0 +1,106 @@
+<html><head><meta charset="utf-8"><title>Dubbing Studio Explained</title>
+<style>body{font-family:'DejaVu Sans',sans-serif;font-size:10pt;line-height:1.4}h1{font-size:20pt;color:#0b5f6e}h2{font-size:14pt;color:#0b5f6e;border-bottom:1px solid #0b5f6e;margin-top:18pt}h3{font-size:11pt;margin-bottom:2pt}code{font-family:'DejaVu Sans Mono';font-size:9pt}pre{font-family:'DejaVu Sans Mono';font-size:8.5pt;background:#f1f4f4}table{border-collapse:collapse}td,th{border:1px solid #999;padding:3pt;font-size:9pt}</style></head><body>
+<h1>Dubbing Studio: How It Works, and How to Present It</h1>
+<p>Every number below comes from the code (file names in brackets).</p>
+
+<h2>A. The system in one sentence</h2>
+<p>A YouTube link goes into a 10-stage pipeline (a LangGraph graph). Each stage reads a shared state and saves its files to <code>cache/&lt;video&gt;/</code>. The output is the same video with a new soundtrack in the target language and the lips redrawn. Every stage caches its work, so an edit to one line takes seconds instead of minutes.</p>
+
+<h2>B. Stage by stage</h2>
+<h3>1. Download [steps/download.py]</h3>
+<ul><li>yt-dlp fetches the video, capped at 720p and preferring H.264. The video stream is copied into the output untouched, so higher resolution would only cost download time.</li>
+<li>Two audio files: <code>audio.wav</code> (16 kHz mono, analysis only) and <code>audio_hq.wav</code> (44.1 kHz stereo, the base of the final mix).</li>
+<li>A clip range can be chosen, or a file uploaded.</li></ul>
+<h3>2. Separate [steps/separate.py]</h3>
+<ul><li>Demucs <code>htdemucs</code> splits the audio into vocals and a background bed (music, effects, room tone).</li>
+<li>Vocals give cleaner input for transcription, speakers and pitch. The bed goes under the dub, so the original voice is removed, not just turned down.</li></ul>
+<h3>3. Transcribe [steps/transcribe.py]</h3>
+<ul><li>faster-whisper <code>large-v3</code> gives word-level timestamps, with <code>vad_filter=True</code> and a 500 ms minimum silence.</li>
+<li><b>Silero</b> is the voice-activity detector bundled inside faster-whisper. It decides where speech is and skips silence, avoiding empty segments and hallucinations.</li>
+<li>Gap filling: a second, more sensitive Silero pass (threshold 0.35) finds speech Whisper skipped (soft voices, voice-over on music). Each gap is transcribed on its own; hallucinations like "thanks for watching" are dropped.</li></ul>
+<h3>4. Diarize [steps/diarize.py]: who speaks, their gender, how they speak</h3>
+<ul><li><b>pyannote</b> speaker-diarization-community-1 gives speaker turns and handles overlap (needs HF_TOKEN). Fallback: <b>ECAPA</b> voiceprints (SpeechBrain) on 1.5 s windows hopping 0.75 s, clustered.</li>
+<li>Second opinion: each speaker's windows are re-clustered by voiceprint. A speaker is split only if two clearly different voices appear (similarity below 0.35, each at least 1.5 s).</li>
+<li>Words are split at speaker changes, then joined into sentences, never across two speakers.</li>
+<li>Faces [video/faces.py]: ArcFace identities (insightface) plus mouth movement can split characters the voice model merged. Only acts when more talking faces than speakers are seen.</li>
+<li>Merge: two "speakers" with voice similarity of at least 0.50 are merged (e.g. a raised voice).</li>
+<li>Gender: two wav2vec2 classifiers averaged over all of a speaker's lines. Faces overrule them when clear. Pitch (180 Hz or higher = female) is only the fallback.</li>
+<li>Delivery [speech/prosody.py]: pitch, range, loudness, rate and voicing of each line are scored against that speaker's own baseline (robust z-score), giving labels like calm, energetic, quick.</li>
+<li>Indic sources: Bodhan indic-transcribe rewrites each line's text; Whisper still supplies timing.</li></ul>
+<h3>5. Refine [steps/refine.py]</h3>
+<ul><li>An LLM (Claude Sonnet via OpenRouter) sees Whisper's and Bodhan's text, neighbouring lines and the title, and writes what was actually said, without translating.</li>
+<li>It marks lines high/low confidence and speech/singing/noise (noise is not dubbed). Chunks of 40 lines.</li></ul>
+<h3>6. Translate [steps/translate.py]</h3>
+<ul><li><b>Indic</b> (default): Bodhan indic-translate line by line, then the <b>dubbing director</b> [text/director.py], one LLM pass over the whole conversation, fixes gender agreement in verbs, spoken register, forms of address and timing, and splits lines holding two speakers.</li>
+<li><b>Concise</b>: Bodhan's lines kept, only shortened to fit; no director. <b>LLM only</b>: the LLM translates the whole dialogue at once.</li>
+<li>Time budget [text/length_fit.py]: characters allowed = slot seconds x characters per second x speaker tempo x 0.95. The slot is the line's length plus at most 0.3 s of borrowed silence.</li>
+<li>Characters per second is measured per voice [voice/tts_rate.py, stored in cache/_tts_rates.json; default 14], because Tamil packs more characters per syllable than Hindi.</li>
+<li>Tempo [speech/pace.py] = the speaker's syllables per second compared with 5.0, clamped to 0.75 to 1.3.</li>
+<li>A line more than 1.15x over budget is rewritten shorter. A per-video glossary of names and words goes to every translator.</li></ul>
+<h3>7. Synthesize [steps/synthesize.py]</h3>
+<ul><li>Casting [voice/casting.py]: one voice per speaker for the whole video. The most-talking speaker gets the native voice; others get the unused voice with the closest measured pitch. UI picks always win.</li>
+<li>Engines: Bodhan indic-speak (about 45 voices, 22 languages), Sarvam Bulbul (11 languages), and in International mode Kokoro and Piper. Lines run in parallel through a rate-limit gate [bodhan_gate.py] that reads Bodhan's own limits from response headers and obeys 429 retry-after.</li>
+<li>Style: one pace style per speaker (lecture, audiobook, news...) chosen from their tempo.</li>
+<li><b>Refit</b> [voice/refit.py], at most 2 rounds: every real clip is measured. A clip needing more than 1.15x (1.30x if the slot is under 1.5 s) is rewritten shorter and re-spoken. A dub under 80% of the original (lines of 1.5 s or more) is lengthened so lips don't move in silence.</li></ul>
+<h3>8. Align [steps/align.py]: the speed question</h3>
+<ul><li>Slot = time from the line's start until 0.08 s before the next line, borrowing at most 1.0 s of following silence. Two dubs never overlap.</li>
+<li>need = clip length / slot.<br>
+- need 1.0 or less and clip under 95% of the original: slow gently; <b>floor 0.90x</b>.<br>
+- need 1.0 or less otherwise: leave as is.<br>
+- need above 1.0: <b>sped up by exactly what it needs. No hard ceiling; words are never cut.</b></li>
+<li>Up to <b>1.10x</b> is unnoticeable. Above <b>1.25x</b> the line is still sped up but logged as audible (e.g. "line 10 needs 1.58x").</li>
+<li>Smoothing: neighbouring lines of one speaker closer than 1.0 s stay within 0.15 speed of each other (the slower line is sped up, never the fast one slowed).</li>
+<li>Stretching uses <b>rubberband</b> (pitch-preserving); fallback ffmpeg <code>atempo</code>. 15 ms fades on every clip; silence trimmed at -40 dB.</li>
+<li><b>Voice cloning (Seed-VC)</b> also runs here: each TTS line is converted to the original speaker's timbre using up to 25 s of their clean lines as reference. A clone is rejected if its length differs by more than about 2%, its loudness envelope correlation is under 0.6, its pitch is more than 5 semitones off, or its gender is wrong. Rejected lines retry with the speaker's shared reference, then fall back to plain TTS.</li></ul>
+<h3>9. Lip sync [steps/lipsync.py]</h3>
+<ul><li>Smart planner [video/smart_sync.py]: each line is cut into shots at camera cuts; every face turned no more than about 40 degrees is cropped and scored with <b>SyncNet</b> against the original voice. A speaking face matches at an offset of 4 frames or less with confidence of at least 1.5 (0.8 for a lone face in a shot over 3 s). Listeners and photos score badly and are not synced: "when unsure, don't sync".</li>
+<li><b>LatentSync 1.6</b> (diffusion) redraws the mouth. About 10 GB GPU per worker; 2 workers on 24 GB; renders at 25 fps.</li>
+<li><b>RAFT optical flow</b> [video/frame_interp.py] converts 25 fps to the video's frame rate; fallback ffmpeg blending.</li>
+<li>Without enough free GPU memory lip sync is skipped; the dub still works. Lip sync changes video only, never audio.</li></ul>
+<h3>10. Assemble [steps/assemble.py]</h3>
+<ul><li>Outside dialogue the original audio stays; inside dialogue the Demucs bed is crossfaded in (10 ms).</li>
+<li>Each dub is placed at its time. [audio/mixing.py] keeps it at least 8 dB above the music, lifting the dub by at most 6 dB and ducking the music by at most 8 dB.</li>
+<li>Loudness normalised to <b>-14 LUFS</b>, true peak ceiling -1 dBTP, saved as AAC. Lip-synced shots are overlaid onto the original frames only for their own time spans, so timing cannot drift.</li></ul>
+<h3>Extras</h3>
+<ul><li><b>Song mode</b>: sung lines are detected by held notes (sung chant 0.35, speech at most 0.06) and the AudioSet AST classifier. By default the original singing is kept; optionally Lyria 3 re-sings the lyrics (about $0.04 per phrase, max 12).</li>
+<li><b>Ask / edit tab</b> [edits/edit_planner.py]: "make line 5 sadder" becomes typed, validated actions (about 15 kinds); only the affected stages re-run.</li>
+<li>Version history (restorable), audition of one line before applying, ETA learned from past runs.</li></ul>
+
+<h2>C. Code structure</h2>
+<pre>Dubbing_Studio/
+  scripts/setup_gpu.sh        one-shot installer
+  .env                        API keys
+  dubbing/
+    server/   FastAPI: app.py (API), jobs.py (one-at-a-time queue + SSE),
+              runner.py, projects.py (no DB: a project is a cache folder),
+              revise.py / audition.py / versions.py / eta.py
+    pipeline/ graph.py (4 LangGraph graphs), state.py (Segment, PipelineState)
+      steps/  the 10 stages
+      speech/ speaker_turns, gender, prosody, pace, bodhan_asr
+      text/   director, dialogue, length_fit, line_by_line, glossary, llm
+      voice/  casting, tts, catalogue, voice_clone, refit, styles, tts_rate
+      audio/  mixing     video/ faces, smart_sync, shot_planner, compose, frame_interp
+      music/  song_detect, song_mode     edits/ edit_planner
+    web/      Vue 3 (no build step) UI, d3 globe
+    LatentSync/ SeedVC/ Separator/  third-party models in their own venvs
+    cache/    outputs per video     tests/ tools/</pre>
+<p>Four design ideas: (1) everything cached by input hash; (2) four graphs (full, edit, re-voice, lip-sync-later) reuse the same stage functions; (3) fail soft: every model has a fallback (pyannote to ECAPA, rubberband to atempo, clone to TTS, lip sync skipped without a GPU); (4) words are never cut: the line is rewritten shorter, then sped up only as far as needed.</p>
+
+<h2>D. Video 1: Project demonstration (about 8-10 min, at least 3 diverse cases)</h2>
+<p>For each case: show the original, then the dub, then one thing the log proves.</p>
+<ol><li><b>Two-person small talk to Hindi or Tamil</b>: speaker detection, gender-correct verbs, one consistent voice per person.</li>
+<li><b>Single-speaker lecture or talk to another language (Telugu, Bengali)</b>: pace, timing and lip sync; open the log to show "Fitted N clips ... worst need X".</li>
+<li><b>Hard content: film clip or trailer with music, many characters or a song</b>: face-based speaker splits, music kept, song detection.</li>
+<li><b>Bonus: Ask tab</b>: "make line 5 more casual", only that line redoes in seconds, then restore the old version from history.</li></ol>
+<p>Run each clip once in advance; rate-limit waits (60 s each) are not worth showing live.</p>
+
+<h2>E. Video 2: Code walkthrough (about 10-12 min)</h2>
+<ol><li>The problem in 30 s, then the 10-stage table from the README.</li>
+<li>Setup: <code>bash scripts/setup_gpu.sh</code>, the <code>.env</code> keys (say what each is for, show no values), <code>python -m server</code>, open localhost:8000.</li>
+<li>The folder tree from section C.</li>
+<li>graph.py and state.py: the graphs, and the Segment object every stage fills in.</li>
+<li>Three deep dives: diarize (pyannote, classifiers, faces); the length-fitting loop (translate budget, refit, align); lip sync (SyncNet then LatentSync).</li>
+<li>Robustness: the Bodhan gate, caching, fallbacks, tests.</li>
+<li>Close with the Ask tab as the feature that sets this apart.</li></ol>
+<p>If asked: the default is an LLM director plus Bodhan, so wording quality depends on those services. Lines needing more than 1.25x are sped up and flagged in the log, never cut.</p>
+</body></html>
