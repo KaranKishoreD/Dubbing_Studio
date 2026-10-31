@@ -164,7 +164,7 @@ method.
 
 ## 4. Installation
 
-Expected time: **1–2 hours**, almost all of it downloading (about 25 GB of
+Expected time to install: **10-15 minutess**, almost all of it downloading (about 25 GB of
 packages and models). On a slow connection it can take several hours. Run it
 in `tmux` or `screen` so it survives a dropped SSH session.
 
