@@ -116,16 +116,18 @@ The original music, sound effects and room tone are kept; only the voices change
 
 | | Version | Check with |
 |---|---|---|
-| Linux | Ubuntu 22.04+ or similar (Windows: use WSL2) | `lsb_release -a` |
+| OS | Linux (Ubuntu 22.04+ or similar), or Windows 10/11 (WSL2 recommended) | Linux: `lsb_release -a`<br>Windows: `winver` |
 | NVIDIA driver | **570 or newer** (needed for CUDA 12.8) | `nvidia-smi` |
-| Python | **3.11** exactly | `python3.11 --version` |
+| Python | **3.11** exactly | Linux: `python3.11 --version`<br>Windows: `py -3.11 --version` |
 | ffmpeg | any recent | `ffmpeg -version` |
 | git | any | `git --version` |
 | rubberband | optional, for better time-stretching | `rubberband --version` |
 
 You do **not** need to install CUDA itself; it comes with the Python packages.
 
-Install the system packages on Ubuntu:
+Install the system packages.
+
+**Linux (Ubuntu):**
 
 ```bash
 sudo apt update
@@ -138,6 +140,31 @@ If `python3.11` is not available on your Ubuntu version:
 sudo add-apt-repository -y ppa:deadsnakes/ppa
 sudo apt update && sudo apt install -y python3.11 python3.11-venv
 ```
+
+**Windows, recommended (WSL2).** This runs the Linux version inside Windows,
+so every Linux command in this guide works unchanged. In PowerShell as
+Administrator, then restart:
+
+```powershell
+wsl --install -d Ubuntu-22.04
+```
+
+Open the Ubuntu app, install the Linux packages above, and follow the Linux
+commands from there. Install the current NVIDIA Windows driver (570 or
+newer); WSL2 uses it, so do not install a Linux GPU driver inside Ubuntu.
+
+**Windows, native (PowerShell).** For the tools only; the setup script is
+a bash script, so run it from Git Bash (installed with Git):
+
+```powershell
+winget install --id Git.Git -e
+winget install --id Gyan.FFmpeg -e
+winget install --id Python.Python.3.11 -e
+```
+
+Close and reopen the terminal afterwards so the new tools are found.
+rubberband is optional on Windows; without it the studio uses ffmpeg's
+`atempo`.
 
 ---
 
@@ -169,12 +196,23 @@ in `tmux` or `screen` so it survives a dropped SSH session.
 
 ### Step 1: Get the code
 
+Linux, WSL2, macOS and Windows PowerShell all use the same commands:
+
 ```bash
 git clone https://github.com/KaranKishoreD/Dubbing_Studio.git
 cd Dubbing_Studio
 ```
 
 ### Step 2: Run the setup script
+
+**Linux / WSL2:**
+
+```bash
+bash scripts/setup_gpu.sh
+```
+
+**Windows native:** open **Git Bash** in the project folder (right-click,
+*Show more options*, *Open Git Bash here*) and run the same command:
 
 ```bash
 bash scripts/setup_gpu.sh
@@ -201,8 +239,16 @@ When it finishes it prints `Setup complete.`
 Open `.env` in the project root (the setup script created it) and paste the
 keys from [section 3](#3-accounts-and-api-keys):
 
+**Linux / WSL2:**
+
 ```bash
 nano .env
+```
+
+**Windows native (PowerShell):**
+
+```powershell
+notepad .env
 ```
 
 ```ini
@@ -221,10 +267,12 @@ One command checks the system tools, Python environment, GPU, optional
 models, API keys (names only) and the tests, and changes nothing:
 
 ```bash
-bash scripts/check_setup.sh
+bash scripts/check_setup.sh          # Linux / WSL2 / Git Bash
 ```
 
-Or by hand:
+Or by hand.
+
+**Linux / WSL2:**
 
 ```bash
 source .venv/bin/activate
@@ -232,6 +280,18 @@ cd dubbing
 python -m pytest -q
 python -c "import torch; print(torch.cuda.get_device_name(0))"
 ```
+
+**Windows native (PowerShell):**
+
+```powershell
+.venv\Scripts\Activate.ps1
+cd dubbing
+python -m pytest -q
+python -c "import torch; print(torch.cuda.get_device_name(0))"
+```
+
+If PowerShell refuses to run the activation script, run
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once and try again.
 
 The tests should say `passed`, and the second command should print your GPU's
 name.
@@ -241,21 +301,43 @@ name.
 For a machine without an NVIDIA GPU (much slower: expect over an hour per
 minute of video, and no lip sync):
 
+**Linux / WSL2:**
+
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r dubbing/requirements.txt
 cp dubbing/.env.example .env      # then add your keys
 ```
 
+**Windows native (PowerShell):**
+
+```powershell
+py -3.11 -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r dubbing/requirements.txt
+copy dubbing\.env.example .env   # then add your keys
+```
+
 ---
 
 ## 5. Starting the studio
 
-Every time:
+Every time.
+
+**Linux / WSL2:**
 
 ```bash
 cd Dubbing_Studio
 source .venv/bin/activate
+cd dubbing
+python -m server
+```
+
+**Windows native (PowerShell):**
+
+```powershell
+cd Dubbing_Studio
+.venv\Scripts\Activate.ps1
 cd dubbing
 python -m server
 ```
@@ -888,7 +970,7 @@ environment), `dubbing/voices/` (downloaded Piper voices), and `dubbing/cache/`
 | First run seems stuck | Models are downloading (several GB). Press **Show details** on the progress bar, or watch `logs/ui_debug.log`. |
 | The page asks for a password | `STUDIO_PASSWORD` is set in `.env`; user name `studio`. |
 | Video will not play over a shared link | Use the Cloudflare tunnel (section 5), not an SSH tunnel through a slow jump host. |
-| `ffmpeg: not found` | `sudo apt install ffmpeg`, then restart the studio. |
+| `ffmpeg: not found` | Linux: `sudo apt install ffmpeg`. Windows: `winget install --id Gyan.FFmpeg -e`. Then reopen the terminal and restart the studio. |
 
 The full log of every run is in `logs/ui_debug.log`.
 
