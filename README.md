@@ -1,9 +1,10 @@
 # Dubbing Studio
 
-Paste a YouTube link and get the video back dubbed into an Indian language:
-translated, spoken in voices that match the original speakers, timed to the
-original, and lip-synced. Then ask for changes in plain words ("make line 5
-sadder", "speaker 2 is an older man") and only the affected lines are redone.
+![Dubbing Studio Interface](../images/hero.png)
+
+**Make any video speak in Indian languages.** Paste a link, and get it back dubbed with lip-sync, natural voices, and a single-click edit workflow.
+
+Ask for changes in plain words—"make line 5 sadder", "speaker 2 is an older man"—and only those lines are redone.
 
 **Languages (23):** all 22 scheduled languages of India, plus English. These
 are Hindi, Tamil, Telugu, Kannada, Malayalam, Bengali, Marathi, Gujarati,
