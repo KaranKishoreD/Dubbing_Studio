@@ -15,6 +15,7 @@ __pycache__/
 *$py.class
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
 .ipynb_checkpoints/
 
 # ── Model weights (re-downloaded by scripts/setup_gpu.sh) ─────────────────────
@@ -36,10 +37,11 @@ dubbing/Wav2Lip/
 dubbing/LatentSync/
 dubbing/MuseTalk/
 dubbing/SeedVC/
+dubbing/Separator/
 
 # ── Pipeline artifacts & media ────────────────────────────────────────────────
 dubbing/cache/
-dubbing/.gradio/
+dubbing/compare/
 data/
 outputs/
 *.mp4
@@ -70,3 +72,8 @@ desktop.ini
 .claude/settings.local.json
 logs/
 backups/
+dubbing/web/compare/
+dubbing/voices/
+
+dubbing/cache_archive/
+.gradio/

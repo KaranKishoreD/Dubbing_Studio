@@ -40,6 +40,7 @@ python -m pip install --upgrade pip wheel
 
 echo "▶ Installing base requirements"
 pip install -r dubbing/requirements.txt
+python -m unidic download   # Japanese dictionary for International mode (~500 MB)
 
 echo "▶ Installing GPU requirements (CUDA 12.8 / torch>=2.7 for Blackwell)"
 pip install -r dubbing/requirements-gpu.txt
@@ -122,7 +123,7 @@ if [[ "${ans:-N}" =~ ^[Yy]$ ]]; then
   [ -d "$SVV" ] || python3 -m venv "$SVV"
   python -c "import site;print(site.getsitepackages()[0])" \
       > "$("$SVV/bin/python" -c "import site;print(site.getsitepackages()[0])")/zz_main_venv.pth"
-  "$SVV/bin/pip" install munch==4.0.0
+  "$SVV/bin/pip" install munch==4.0.0 hydra-core==1.3.2
   # Only DAC's quantizer is imported; the full package pins old audio libs.
   DAC="$("$SVV/bin/python" -c "import site;print(site.getsitepackages()[0])")/dac"
   mkdir -p "$DAC/nn" && touch "$DAC/__init__.py" "$DAC/nn/__init__.py"
@@ -132,6 +133,17 @@ if [[ "${ans:-N}" =~ ^[Yy]$ ]]; then
   done
   echo "✓ Seed-VC ready (weights download on first use)"
 fi
+
+# ── 5c. Song mode: vocal separator (BS-RoFormer via audio-separator) ──────────
+# audio-separator is already in the main venv (requirements.txt). song_mode.py
+# runs it from its own folder so its model files stay in dubbing/Separator/;
+# this overlay venv just points back at the main venv's packages.
+SEPV=dubbing/Separator/.venv-sep
+mkdir -p dubbing/Separator/models
+[ -d "$SEPV" ] || python3 -m venv "$SEPV"
+python -c "import site;print(site.getsitepackages()[0])" \
+    > "$("$SEPV/bin/python" -c "import site;print(site.getsitepackages()[0])")/zz_main_venv.pth"
+echo "✓ Separator ready (model downloads on first use)"
 
 # ── 6. Pre-warm the models that auto-download ─────────────────────────────────
 echo "▶ Pre-warming Whisper + Demucs (first run would otherwise stall)"
@@ -163,6 +175,6 @@ Next:
        https://huggingface.co/pyannote/segmentation-3.0
   3. Run:
        source .venv/bin/activate
-       cd dubbing && python -m ui.app
+       cd dubbing && python -m server      # then open http://127.0.0.1:8000
 ─────────────────────────────────────────────────────────────
 EOF

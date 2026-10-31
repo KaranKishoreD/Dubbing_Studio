@@ -1,6 +1,12 @@
-from pathlib import Path
+"""
+Where each project's files live: cache/<project id>/, with one file per line
+under segments/. Everything a stage makes is saved here, which is what lets
+a re-run or an edit reuse finished work.
+"""
+
 import hashlib
 import re
+from pathlib import Path
 
 CACHE_ROOT = Path("cache")
 
@@ -22,6 +28,8 @@ def instruction_hash(instruction: str) -> str:
 
 
 def video_id_from_url(url: str) -> str:
+    if url.startswith("upload:"):  # a file uploaded in the studio: its own id
+        return url.split(":", 1)[1]
     patterns = [
         r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})",
         r"(?:embed/)([A-Za-z0-9_-]{11})",

@@ -20,8 +20,14 @@ accelerate>=0.34.0
 mediapipe>=0.10.0
 opencv-python>=4.8.0
 
-# UI
-gradio>=5.0.0
+# International mode: open voices for world languages
+kokoro>=0.9.4
+misaki[en,ja,zh]>=0.9.4
+piper-tts>=1.8.0
+
+# The web studio (server/ + web/)
+fastapi>=0.110
+uvicorn>=0.29
 
 # Utilities
 python-dotenv>=1.0.0

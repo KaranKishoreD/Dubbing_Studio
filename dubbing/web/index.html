@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dubbing Studio</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23ff9a1f'/><text x='16' y='23' font-size='18' text-anchor='middle' fill='%231e0f00' font-family='sans-serif'>ध</text></svg>" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400&family=Mukta:wght@500;600;700&family=Noto+Sans+Ol+Chiki:wght@500;700&family=Rozha+One&family=Yatra+One&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/css/studio.css" />
+    <script>
+      // Light or dark before the first paint: the saved choice, else the system's.
+      try {
+        const t = localStorage.getItem("theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+        document.documentElement.dataset.theme = t;
+        // Indic or International look, from the home page switch
+        document.documentElement.dataset.mode = localStorage.getItem("home-mode") || "indic";
+      } catch {}
+    </script>
+  </head>
+  <body>
+    <div id="app" v-cloak></div>
+    <!-- d3 + topojson-client (globals) draw the International-mode globe -->
+    <script src="/vendor/d3.min.js"></script>
+    <script src="/vendor/topojson-client.min.js"></script>
+    <script type="module" src="/js/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,16 @@
+# Tool settings only; dependencies are in requirements.txt.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["LatentSync", "SeedVC", "Separator", "cache", "compare"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501", "E731", "E741", "E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pipeline", "server", "tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
