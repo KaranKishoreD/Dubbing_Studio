@@ -2,7 +2,7 @@
 
 ![Dubbing Studio Interface](./hero.png)
 
-**Make any video speak in Indian languages.** Paste a link, and get it back dubbed with lip-sync, natural voices, and a single-click edit workflow.
+**Make any video speak in Indian languages with additional support for languages across the globe** Paste a link, and get it back dubbed with lip-sync, natural voices, and a single-click edit workflow.
 
 Ask for changes in plain words—"make line 5 sadder", "speaker 2 is an older man"—and only those lines are redone.
 
